@@ -1,0 +1,74 @@
+# Training artifacts and datasets
+/checkpoints/
+/datasets/
+/logs/
+/wandb/
+/assets/
+/cache/
+/envs/
+/tmp/
+
+# Duplicate upstream working trees at the workspace root
+/openpi/
+/lerobot/
+
+# Local notes that may contain machine-specific information
+/note.txt
+
+# Model weights, datasets, media, archives and CAD assets
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.onnx
+*.whl
+*.parquet
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.stl
+*.usd
+*.usda
+*.usdc
+*.glb
+*.obj
+*.npy
+*.npz
+
+# Python and build caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Local IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime and temporary files
+*.log
+*.lock
+*.tmp
+*.partial
+*.aria2
+
+# Nested repository metadata is not part of the source snapshot
+**/.git/
+

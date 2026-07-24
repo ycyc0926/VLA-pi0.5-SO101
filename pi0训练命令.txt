@@ -1,0 +1,148 @@
+1. 可视化数据集
+https://huggingface.co/spaces/lerobot/visualize_dataset
+抓取放置小球的数据集名称 VLALearner/pi0_pick_and_place
+scp -r likunwei@192.168.1.110:/home/likunwei/pi0/VLA/openpi/wandb/offline-run-20260506_165944-jwoioh6f  C:\Users\Public\Downloads\
+
+# 1. 确保你本地有 wandb 
+pip install wandb  
+
+# 2. 登录（如果还没登过，会弹出网页让你点一下授权） 
+wandb login 
+ 
+# 3. 开始上传 
+wandb sync C:\Users\Public\Downloads\offline-run-20260506_165944-jwoioh6f
+
+
+2. LeRobot+LoRA
+tmux new -s pi0_train
+conda activate lerobot
+CUDA_VISIBLE_DEVICES=0 lerobot-train --config_path pi0_lora_train.yaml
+ctrl+B 然后 D分离会话
+重新开机后SSH登陆服务器，重新附着
+tmux attach -t pi0_train
+3. OpenPI+LoRA
+- 参数归一化
+(lerobot) likunwei@vla-device:~/pi0/VLA/openpi$ PYTHONPATH=src:/home/likunwei/lerobot/src uv run scripts/compute_norm_stats.py  --config-name=pi05_so101_lora
+- 训练
+# 切换conda环境
+conda activate lerobot
+
+# 进入openpi目录
+cd pi0/VLA/openpi
+
+# 2. 设置只可见卡 1
+export CUDA_VISIBLE_DEVICES=1 
+export XLA_PYTHON_CLIENT_MEM_FRACTION=.85
+export WANDB_MODE=offline
+export LD_LIBRARY_PATH=/home/likunwei/miniconda3/envs/pi0-zero/lib:$LD_LIBRARY_PATH
+OPENPI_ACTION_LOSS_DIM=6
+
+PYTHONPATH=src:/home/likunwei/lerobot/src uv run scripts/train.py pi05_so101_lora \
+    --exp-name=blacknew_mask6_camera2 \
+    --checkpoint-base-dir=/hdd/likunwei/openpi_checkpoints \
+    --resume
+- 推理
+# 切换conda环境
+conda activate lerobot
+
+# 进入openpi目录
+cd pi0/VLA/openpi
+
+# 设置环境变量
+export CUDA_VISIBLE_DEVICES=0
+export LD_LIBRARY_PATH=/home/likunwei/miniconda3/envs/pi0-zero/lib:$LD_LIBRARY_PATH
+
+# 启动推理服务
+PYTHONPATH=src:/home/likunwei/lerobot/src uv run scripts/serve_policy.py \
+  --port 5000 \
+  policy:checkpoint \
+  --policy.config pi05_so101_lora \
+  --policy.dir /hdd/likunwei/openpi_checkpoints/pi05_so101_lora/blacknew_mask6/60000
+/hdd/likunwei/openpi_checkpoints/pi05_so101_lora_10_01std/blacknew_10horizon_01std/49999
+/hdd/likunwei/openpi_checkpoints/pi05_so101_lora_10_015std/blacknew_10horizon_015std/49999
+# 1. 激活环境
+conda activate lerobot
+
+# 2. 进入 VLA 目录
+cd C:\Users\DELL\Desktop\PI0_Workspace\VLA
+
+# 3. 设置路径环境变量（把 LeRobot 原版框架路径加进去）
+set PYTHONPATH=%cd%\packages\openpi-client\src;C:\Users\DELL\Desktop\PI0_Workspace\lerobot\src
+
+# 4. 启动客户端
+# ⚠️ 注意：把 192.168.1.110 换成 Ubuntu 服务器的真实局域网 IP
+# ⚠️ 注意：确认 COM16 是从臂，2 是环境相机，0 是手爪相机
+python openpi\packages\openpi-client\src\openpi_client\lkw_aysnc_so101_client.py --host 192.168.1.110 --port 5000 --serial COM16 --cam_top 2 --cam_wrist 0
+
+export PYTHONPATH=$PYTHONPATH:$(pwd)/packages/openpi-client/src:/home/likunwei/lerobot/src
+python packages/openpi-client/src/openpi_client/lkw_aysnc_so101_client.py
+4. 目标训练结果
+[图片]
+
+[图片]
+5. 训练参数作用
+5.1 Loss
+- 快速下降期（0-500步）：模型在迅速学习数据集中的“大趋势”（比如：抓取任务中手臂应该往前伸）
+- 震荡期（1.5k步之后）
+  - 注意 Loss 开始出现明显的**“锯齿状”波动**。这是一个极好的信号！这说明你的图像输入起作用了。模型在尝试根据不同的视觉画面（方块在左还是在右）调整动作。如果 Loss 是一条毫无波动的直线，反而说明它在“死记硬背”
+- 结论：目前的 Loss 水平（0.017）已经优于你之前黑图时的 0.03，说明视觉信息的加入让模型预测更准了
+5.2 Grad_norm (梯度范数) —— 学习的“力度”
+- 反映信息：模型参数更新的幅度。它告诉你模型每一步“改动”得有多狠。
+- 状态分析：
+初始很高，表示在大幅度修正模型;随后稳定在 0.1 附近，并在 2k 步后出现剧烈跳动。
+- 深度解读
+  - 尖峰信号：2.5k 步附近的几个大尖峰代表模型遇到了“难题”或“新知识”（例如：视觉画面中出现了物体被抓起的关键瞬间）
+  - 安全性检查：你的梯度峰值在 0.4 左右。因为你设置了 clip_gradient_norm=0.5，所以目前没有触发严重的梯度爆炸，模型运行在安全区间。如果这个值长期是一条横平的小直线，说明学习率可能太低了；现在的波动说明学习率（5e-4）是合理的。
+5.3 Param_norm (参数范数) —— 模型的“进化程度”
+- 反映信息：LoRA 权重矩阵中数值的总强度（可以理解为模型“脑回路”的复杂程度）。
+- 当前状态：从 1804 稳步上升到了 1808 左右。
+- 深度解读：
+  - 稳步增长：由于你是从预训练模型开始微调的，param_norm 的上升意味着 LoRA 层正在从无到有地构建新的知识。
+  - 斜率分析：曲线的斜率在 2k 步之后变陡了。结合 Loss 的震荡，这说明经过了前期的 Warmup（预热），模型现在进入了高速学习期，正在通过增大权重数值来强化对视觉特征的记忆。
+5.4 模型为什么在warmup步骤出现param_norm的大幅度变化
+5.4.1 学习率从“零”到“巅峰”的拉升过程
+Warmup 的本质是让学习率 LR 从 $$0$$ 线性增加到 peak_lr（你设定的 $3e-4$）。
+- 计算公式： $$Update = LR \times Gradient$$
+- 逻辑分析：在最初的几百步，学习率极低（接近 0），所以参数几乎不动。随着步数接近 3000，学习率变得越来越大。
+- 结果：同样的 Loss 误差，在第 100 步产生的更新量微乎其微，但在第 2500 步产生的更新量（即 grad_norm）会大得多。你看到的波动其实是模型正在“发力”的预演。
+5.4.2 视觉特征的“初次冲击”
+这是最关键的物理原因。
+- 背景：你的 Pi0 预训练模型之前只见过通用图像，没见过你这个特定的“黑盒子+机械臂”环境。
+- 冲突：在 Warmup 前期，LoRA 层是近乎全零初始化的。随着学习率抬升，模型第一次尝试把“看到方块”和“输出坐标”联系起来。
+- 波动来源：每一批次（Batch）的 16 张图都不一样。由于模型还没建立起稳定的特征提取能力，它对不同图片的反应极其敏感。一张光影稍有不同的图，就会导致梯度方向巨大的改变，从而反映在 grad_norm 的剧烈震荡上。
+5.4.3 优化器（AdamW）的“冷启动”状态
+AdamW 优化器内部维护着两个状态：动量（Momentum）和方差（Variance）。
+- 原理：它需要通过前几千步的数据来估算每个参数的“历史波动频率”。
+- 不稳定期：在 Warmup 结束（3000步）之前，优化器内部的这些统计量还没有稳定。此时的梯度更新非常依赖于当前 Batch 的特征。
+- 表现：这就像一辆刚发动的赛车，引擎转速（梯度）还没稳下来，踩油门（学习率增加）时会有明显的抖动。
+warmup_steps=3000，为什么在预热阶段grad_norm会大幅度变化
+这是一个非常敏锐的观察！直觉上，warmup（预热）应该是“平稳过渡”，但实际上，在 Warmup 阶段 grad_norm 出现剧烈波动甚至大幅度跳变，反而是逻辑上的必然。
+结合你的 5090 训练日志和 WandB 图表，主要有以下三个原因：
+5.4.4 学习率从“零”到“巅峰”的拉升过程
+Warmup 的本质是让学习率 (LR) 从 0 线性增加到 peak_lr（你设定的 3e−4）。
+- 计算公式：Update=LR×Gradient
+- 逻辑分析：在最初的几百步，学习率极低（接近 0），所以参数几乎不动。随着步数接近 3000，学习率变得越来越大。
+- 结果：同样的 Loss 误差，在第 100 步产生的更新量微乎其微，但在第 2500 步产生的更新量（即 grad_norm）会大得多。你看到的波动其实是模型正在“发力”的预演。
+
+---
+5.4.2 视觉特征的“初次冲击”
+这是最关键的物理原因。
+- 背景：你的 Pi0 预训练模型之前只见过通用图像，没见过你这个特定的“黑盒子+机械臂”环境。
+- 冲突：在 Warmup 前期，LoRA 层是近乎全零初始化的。随着学习率抬升，模型第一次尝试把“看到方块”和“输出坐标”联系起来。
+- 波动来源：每一批次（Batch）的 16 张图都不一样。由于模型还没建立起稳定的特征提取能力，它对不同图片的反应极其敏感。一张光影稍有不同的图，就会导致梯度方向巨大的改变，从而反映在 grad_norm 的剧烈震荡上。
+
+---
+5.4.3 优化器（AdamW）的“冷启动”状态
+AdamW 优化器内部维护着两个状态：动量（Momentum）和方差（Variance）。
+- 原理：它需要通过前几千步的数据来估算每个参数的“历史波动频率”。
+- 不稳定期：在 Warmup 结束（3000步）之前，优化器内部的这些统计量还没有稳定。此时的梯度更新非常依赖于当前 Batch 的特征。
+- 表现：这就像一辆刚发动的赛车，引擎转速（梯度）还没稳下来，踩油门（学习率增加）时会有明显的抖动。
+
+---
+💡 如何从图中读懂这个信号？
+看你的 grad_norm 图：
+1. 0 - 1.5k 步：梯度在下降。这是模型在迅速消除那些最明显的错误（比如动作幅度过大）。
+2. 1.5k - 3k 步：梯度开始出现锯齿状波动并有上升趋势。这说明 Warmup 已经把学习率带到了一个能“深入挖掘”视觉细节的高度。
+3. 预测 3k 步之后：
+  - 一旦 Warmup 结束，学习率开始进入 Cosine Decay（余弦衰减）阶段。
+  - 你会看到 grad_norm 的波动会逐渐变小，整体趋势会变得更加平缓。
