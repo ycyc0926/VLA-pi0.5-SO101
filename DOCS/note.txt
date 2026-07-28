@@ -1,0 +1,71 @@
+cd /root/autodl-tmp/VLA
+
+新建tmux:
+tmux new -s pi05_train
+查看当前所有 tmux：
+tmux ls
+重新进入：
+tmux attach -t pi05_train
+查看显卡：
+watch -n 2 nvidia-smi
+
+先在当前 tmux 终端执行：
+  conda activate /root/autodl-tmp/envs/pi0_env
+
+  unset WANDB_API_KEY
+  unset WANDB_BASE_URL
+  unset WANDB_MODE
+  unset WANDB_DISABLED
+  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
+  wandb login --cloud --relogin --verify
+  它会要求粘贴 API Key。请从 W&B 用户设置页面创建或复制有效 Key
+
+  看到类似下面信息才表示验证成功：
+  Successfully logged in
+  Default entity: ...
+
+
+然后重新设置路径：
+  cd /root/autodl-tmp/VLA/custom_vla/openpi
+
+  export SO101_DATASET_DIR=/root/autodl-tmp/VLA/datasets/AlexFeng1/blacknew
+  export OPENPI_DATA_HOME=/root/autodl-tmp/cache/openpi
+  export JAX_COMPILATION_CACHE_DIR=/root/autodl-tmp/cache/jax
+  export HF_HOME=/root/autodl-tmp/cache/huggingface
+  export HF_LEROBOT_HOME=/root/autodl-tmp/VLA/datasets
+  export WANDB_DIR=/root/autodl-tmp/VLA/wandb
+  export TMPDIR=/root/autodl-tmp/tmp
+  export PYTHONPATH=/root/autodl-tmp/VLA/custom_vla/openpi/src
+  export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
+  export CUDA_VISIBLE_DEVICES=0
+
+重新启动训练：
+  python -u scripts/train.py pi05_so101_lora \
+    --exp-name=blacknew_lora_50k_v1 \
+    --project-name=pi05-so101 \
+    --data.repo-id=/root/autodl-tmp/VLA/datasets/AlexFeng1/blacknew \
+    --weight-loader.params-path=/root/autodl-tmp/cache/openpi/openpi-assets/checkpoints/pi05_base/params \
+    --checkpoint-base-dir=/root/autodl-tmp/VLA/checkpoints \
+    --assets-base-dir=/root/autodl-tmp/VLA/assets \
+    --batch-size=16 \
+    --num-workers=4 \
+    --num-train-steps=50000 \
+    --log-interval=10 \
+    --save-interval=1000 \
+    --keep-period=5000 \
+    --lr-schedule.warmup-steps=1000 \
+    --lr-schedule.peak-lr=1e-4 \
+    --lr-schedule.decay-steps=50000 \
+    --lr-schedule.decay-lr=1e-6 \
+    --wandb-enabled \
+    --overwrite \
+    2>&1 | tee /root/autodl-tmp/VLA/logs/blacknew_lora_50k_v1.log
+
+从日志中查找 W&B 网页地址：
+grep -E 'wandb.ai|View run|Tracking run' \
+  /root/autodl-tmp/VLA/logs/blacknew_lora_50k_v1.log
+
+监控 GPU 温度和功耗
+watch -n 2 "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader"
+通常 GPU 100% 利用率是理想状态；温度持续低于约 85°C 一般没有问题。

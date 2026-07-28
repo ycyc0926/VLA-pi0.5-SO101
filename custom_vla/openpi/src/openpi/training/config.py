@@ -1,4 +1,17 @@
-"""See _CONFIGS for the list of available configs."""
+"""See _CONFIGS for the list of available configs.
+
+中文阅读地图：
+1. AssetsConfig / DataConfig：描述数据管线最终需要的“成品配置”。
+2. ModelTransformFactory：把统一的机器人数据变成具体 PI0/PI0.5 模型所需格式。
+3. DataConfigFactory 及各 LeRobot*DataConfig：按机器人/数据集组装数据变换链。
+4. TrainConfig：把模型、数据、优化器、日志和 checkpoint 合成一次实验。
+5. _CONFIGS / get_config()：用字符串 name 找到某个 TrainConfig 实例。
+
+训练输入的固定顺序在 training/data_loader.py::transform_dataset 中：
+Repack -> robot-specific inputs -> Normalize -> model inputs。
+推理输出的逆向顺序在 policies/policy_config.py 中：
+model outputs -> Unnormalize -> robot-specific outputs。
+"""
 
 import torch
 import numpy as np  # 中文注释：供 SYSMO front-only 高斯噪声插件处理 uint8 图像使用。
@@ -121,14 +134,14 @@ class DataConfig:
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
 
-    # Used to adopt the inputs from a dataset specific format to a common format
-    # which is expected by the data transforms.
+    # 中文注释：第一层“字段改名/重组”。例如把 LeRobot 的 observation.images.env
+    # 映射为 SO101Inputs 约定的 observation.images.images_env；通常只用于训练数据集读取。
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
-    # Data transforms, typically include robot specific transformations. Will be applied
-    # before the data is normalized. See `model.Observation` and `model.Actions` to learn about the
-    # normalized data.
+    # 中文注释：第二层“机器人语义适配”，训练和推理共用；负责组装 state、三路 image/mask、
+    # action，并可在归一化前把 absolute action 转成 delta action。
     data_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
-    # Model specific transforms. Will be applied after the data is normalized.
+    # 中文注释：第三层“模型格式适配”，在 Normalize 之后执行；负责 224x224 resize、
+    # prompt tokenization，以及把短 state/action padding 到模型统一 action_dim。
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
@@ -162,6 +175,8 @@ class ModelTransformFactory(GroupFactory):
     default_prompt: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        # 中文注释：Factory 根据 model_type 返回不同的 transform，而不是创建神经网络本身。
+        # PI0 与 PI0.5 的主要差别在 TokenizePrompt 是否把 state 一起离散化进 token。
         match model_config.model_type:
             case _model.ModelType.PI0:
                 return _transforms.Group(
@@ -178,12 +193,16 @@ class ModelTransformFactory(GroupFactory):
                 assert isinstance(model_config, pi0_config.Pi0Config)
                 return _transforms.Group(
                     inputs=[
+                        # 若上游没有 prompt 才注入默认值；客户端/数据集已有 prompt 时不会覆盖。
                         _transforms.InjectDefaultPrompt(self.default_prompt),
+                        # 保持纵横比并 padding 到 224x224，三路图像都处理。
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            # True：state 编入离散 token；False：state 不进入 prompt token。
                             discrete_state_input=model_config.discrete_state_input,
                         ),
+                        # SO101/LIBERO 只有 6/7 维，PI0 默认 action_dim=32；右侧补零统一 shape。
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
@@ -229,12 +248,15 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        # 中文注释：asset_id 决定去哪个子目录读取 norm_stats；默认与 repo_id 相同，
+        # 也可像 blacknew 一样显式设成稳定、无斜杠的名字。
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            # PI0.5/FAST 使用 q01/q99 映射到约 [-1,1]；经典 PI0 使用 mean/std z-score。
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -358,6 +380,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
+                        # 中文注释：RepackTransform 的写法是“新键: 数据集中的旧键”。
+                        # 左侧是 LiberoInputs 接下来要读取的统一接口，右侧是 LeRobot 样本字段。
                         "observation/image": "image",
                         "observation/wrist_image": "wrist_image",
                         "observation/state": "state",
@@ -375,6 +399,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
         data_transforms = _transforms.Group(
+            # inputs 在训练和推理请求进入模型前执行；outputs 只在推理动作离开模型后执行。
             inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
             outputs=[libero_policy.LiberoOutputs()],
         )
@@ -392,6 +417,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
         # extra delta transform.
         if self.extra_delta_transform:
+            # make_bool_mask(6, -1) => 前 6 维 True，其余维（第 7 维 gripper）False。
+            # push 会把 DeltaActions 追加到输入尾部，同时把 AbsoluteActions 放到输出头部，
+            # 从而形成训练 absolute->delta、推理 delta->absolute 的镜像关系。
             delta_action_mask = _transforms.make_bool_mask(6, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
@@ -400,6 +428,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
         # Model transforms include things like tokenizing the prompt and action targets
         # You do not need to change anything here for your own dataset.
+        # Libero 的 prompt 来自数据集 task，因此这里不需要 default_prompt。
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
@@ -520,11 +549,17 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
+    """一次训练/推理实验的顶层配置。
+
+    它本身不执行训练；scripts/train.py 和 training/data_loader.py 读取这些字段，
+    分别创建模型/优化器/checkpoint 管理器与数据流水线。
+    """
+
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
-    # Project name.
+    # 中文注释：W&B project 名；不同 exp_name 的 run 会归到这个 project 下。
     project_name: str = "openpi"
-    # Experiment name. Will be used to name the metadata and checkpoint directories.
+    # 中文注释：本次运行名，也是 checkpoint 路径最后一级；必须由 CLI 或配置提供。
     exp_name: str = tyro.MISSING
 
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
@@ -532,62 +567,66 @@ class TrainConfig:
     # define additional attributes.
     model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
 
-    # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
+    # 中文注释：JAX 训练初始化权重的策略；可从 base checkpoint 部分加载并与当前模型树对齐。
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
-    # Optional path to a PyTorch checkpoint to load weights from.
+    # 中文注释：仅 train_pytorch.py 使用的 safetensors 目录；JAX scripts/train.py 不读取它。
     pytorch_weight_path: str | None = None
 
-    # Precision for PyTorch training.
+    # 中文注释：仅 PyTorch 训练精度；本项目 JAX LoRA 路径主要由模型 dtype 决定。
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    # 中文注释：学习率随 step 如何变化，以及参数用何种梯度更新规则。
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
+    # 中文注释：指数滑动平均参数；None 表示不维护 EMA，LoRA 配置通常关闭以节省内存。
     ema_decay: float | None = 0.99
 
-    # Specifies which weights should be frozen.
+    # 中文注释：匹配“冻结参数”的过滤器；trainable_filter 会取其补集。LoRA 只训练 lora 参数。
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
-    # Determines the data to be trained on.
+    # 中文注释：不是最终 DataConfig，而是工厂；创建 DataLoader/Policy 时才调用 data.create()。
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
-    # Base directory for config assets (e.g., norm stats).
+    # 中文注释：norm_stats 等数据资产根目录；实际目录还会拼接 config name/asset id。
     assets_base_dir: str = "./assets"
-    # Base directory for checkpoints.
+    # 中文注释：checkpoint 根目录；最终为 checkpoint_base_dir/name/exp_name。
     checkpoint_base_dir: str = "./checkpoints"
 
-    # Random seed that will be used by random generators during training.
+    # 中文注释：模型初始化、shuffle、flow matching 噪声等随机过程的可复现种子。
     seed: int = 42
-    # Global batch size.
+    # 中文注释：全局 batch；多设备时由 sharding 进一步切分，不是“每张卡 batch”。
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
+    # 中文注释：0 表示在训练主进程加载；增加它可并行解码视频，但会增加 CPU/内存占用。
     num_workers: int = 2
-    # Number of train steps (batches) to run.
+    # 中文注释：优化器更新次数，不是 epoch 数；一个 step 消耗一个 global batch。
     num_train_steps: int = 30_000
 
-    # How often (in steps) to log training metrics.
+    # 中文注释：每多少 step 聚合并记录 loss/grad_norm 等指标。
     log_interval: int = 100
-    # How often (in steps) to save checkpoints.
+    # 中文注释：普通 checkpoint 保存间隔。
     save_interval: int = 1000
-    # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
+    # 中文注释：能被该周期整除的 checkpoint 长期保留；其他旧点可能被清理。
     keep_period: int | None = 5000
 
-    # If true, will overwrite the checkpoint directory if it already exists.
+    # 中文注释：删除同名实验目录后重训；与 resume 互斥，属于破坏性选项。
     overwrite: bool = False
-    # If true, will resume training from the last checkpoint.
+    # 中文注释：从同一 checkpoint_dir 的最新 step 恢复模型、优化器和数据加载状态。
     resume: bool = False
 
-    # If true, will enable wandb logging.
+    # 中文注释：是否把训练指标、配置和样例图上传 W&B。
     wandb_enabled: bool = True
 
-    # Used to pass metadata to the policy server.
+    # 中文注释：随 Policy 暴露给客户端的机器人元信息，例如 ALOHA reset_pose；不参与 loss。
     policy_metadata: dict[str, Any] | None = None
 
     # If the value is greater than 1, FSDP will be enabled and shard across number of specified devices; overall
     # device memory will be reduced but training could potentially be slower.
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
+    # 中文注释：1 表示不跨设备切分一份模型参数；必须能整除当前 JAX device 数。
     fsdp_devices: int = 1
 
     @property
@@ -798,22 +837,35 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
+        # 中文注释：选择 PI0.5；每个样本监督未来 10 步动作。这里显式关闭离散 state token，
+        # 因而 state 仍可用于 delta 变换/归一化，但不会被 TokenizePrompt 拼进语言 token。
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
+            # LeRobot Hub 数据源；DataLoader 会按 action_horizon 取 action[t:t+10]。
             repo_id="physical-intelligence/libero",
+            # 把 LeRobot tasks.parquet 对应文本注入为样本 prompt。
             base_config=DataConfig(prompt_from_task=True),
+            # LIBERO 原始 action 已是 delta，所以不重复减当前 state。
             extra_delta_transform=False,
         ),
+        # 256 是 global batch；显存不足时最先调低此值。
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
+            # 前 10k step 从很小的学习率线性升到 5e-5。
             warmup_steps=10_000,
             peak_lr=5e-5,
+            # 计划在 1M step 内衰减；本配置只训练 30k，且首尾 lr 都是 5e-5，
+            # 所以 warmup 后实际上近似保持常数 5e-5。
             decay_steps=1_000_000,
             decay_lr=5e-5,
         ),
+        # 先把全局梯度范数裁到 1.0，再执行 AdamW 更新。
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # 同时维护参数的 0.999 EMA 副本，推理/保存时可获得更平滑的权重。
         ema_decay=0.999,
+        # JAX 路径从官方 PI0.5 base 参数初始化，而不是从零训练。
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # 仅 PyTorch 训练脚本读取；占位路径必须在使用 train_pytorch.py 前替换。
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
@@ -1026,18 +1078,21 @@ _CONFIGS = [
     *polaris_config.get_polaris_configs(),
 ]
 
+# 中文注释：注意第一份官方 _CONFIGS 已在上方结束。下面先定义项目自定义 DataConfig，
+# 随后文件又用 `_CONFIGS = [...]` 建立第二份列表；这会覆盖包含 pi05_libero 的第一份列表。
 @dataclasses.dataclass(frozen=True)
 class LeRobotSO101DataConfig(DataConfigFactory):
-    extra_delta_transform: bool = True # SO101 动作是绝对的，设置成True为需要计算 delta动作 
+    # blacknew parquet 保存 absolute joint target；True 表示训练前把前五关节改为相对当前 state 的 delta。
+    extra_delta_transform: bool = True
 
     # 新增：实验参数开关 (默认关闭，不影响原来的配置)
     use_gaussian_noise: bool = False  
     gaussian_std: float = 0.03
 
     @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> ...:
-        # 1. 从硬盘数据里挑出图像和动作
-        # 字典重组Repack:从原始的 Parquet 数据中提取特定列, 映射 LeRobot S0101 键到模型输入
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # 1. 字段重组。RepackTransform 写法是“新键: blacknew 中的旧键”。
+        # 新键刻意与真实 SO101 客户端请求保持一致，使训练样本与推理请求进入同一个 SO101Inputs。
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -1052,18 +1107,22 @@ class LeRobotSO101DataConfig(DataConfigFactory):
             ]
         )
         
+        # 中文注释：这张表目前没有接入 transform，所以不会改变 prompt；当前训练文本实际由
+        # 下方 ModelTransformFactory(default_prompt=...) 注入。保留它仅作为任务编号说明。
         TASK_INDEX_TO_PROMPT = {
             0: "Grab the black cube and place it in the white cup",
         }
-        # 2. 把图像变灰度/归一化，把动作转成 Delta
-        # 物理量变换 Data transforms: 使用自定义 Inputs/Outputs (类似 libero_policy.py)
-        # 创建 so101_policy.py，复制 LiberoInputs/Outputs 并调整
-        # e.g., state_dim=12，image keys: base_0_rgb
+        _ = TASK_INDEX_TO_PROMPT
+
+        # 2. 机器人语义适配。SO101Inputs 只负责图像格式和统一模型键；归一化稍后由
+        # data_loader 根据 norm_stats 自动插入，不能把这里误读成已经 Normalize。
         
         # 逻辑注入：把 SO101Inputs 和噪声插件放到一个列表里
         transform_inputs = [so101_policy.SO101Inputs(model_type=model_config.model_type)]
         
-        # 如果 TrainConfig 里面开启了加噪，就把加噪模块塞进去
+        # 如果 TrainConfig 开启加噪，就在 SO101Inputs 后追加插件。
+        # 注意：SO101Inputs 已把图像收进 data["image"]，而 AddGaussianNoiseImage 仍查找旧的
+        # observation.images.* 顶层键，因此当前实现实际上不会命中；默认 false 不受影响。
         if self.use_gaussian_noise:
             transform_inputs.append(AddGaussianNoiseImage(std=self.gaussian_std))
         
@@ -1072,7 +1131,8 @@ class LeRobotSO101DataConfig(DataConfigFactory):
             outputs=[so101_policy.SO101Outputs()],
         )
 
-        # Delta actions: SO101 绝对动作，False; 如果数据集是 delta, 设 True 并 mask 前6维关节
+        # 3. blacknew 的 action 是 absolute。输入侧将前 5 个关节执行 action-state，
+        # 第 6 维 gripper 保持 absolute；推理输出侧用 AbsoluteActions 把前 5 维加回当前 state。
         if self.extra_delta_transform:
             delta_action_mask = _transforms.make_bool_mask(5, -1)  # 5 关节 delta, 1 gripper绝对位置
             data_transforms = data_transforms.push(
@@ -1080,8 +1140,8 @@ class LeRobotSO101DataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
         
-        # 3. 把图像缩放成 224，把指令变成 Token
-        # 模型兼容处理，“打包封装” ： 1) 图像缩放：不管原始视频是多少分辨率，全部统一 Resize 到 224x224 2) 文本处理 (TokenizePrompt)：把你的字符串指令 "Grab the black cube..." 变成一串数字 ID，让模型能进行数学计算
+        # 4. 模型格式适配：三路图像 resize/pad 到 224x224，注入默认任务文本并 tokenize，
+        # 再把 6 维 state 和 [T,6] action 补到模型统一的 32 维。
         model_transforms = ModelTransformFactory(default_prompt="Grab the black cube and place it in the white cup")(model_config)  # 标准: resize 224x224, tokenize prompt
 
         # 4. 返回一个完整配置
@@ -1150,12 +1210,17 @@ class LeRobotSYSMO32DataConfig(DataConfigFactory):
         # 中文注释：SYSMO-32 使用原始 front 单相机 schema，prompt 从 task_index 映射为数据集任务文本，不依赖 env/hand。
 
 
+# 中文注释（重要）：这里是第二次赋值而不是 `_CONFIGS += [...]`，所以会丢弃上方包含
+# pi05_libero/ALOHA/DROID 的官方配置。文件末尾 _CONFIGS_DICT 只会基于下面这些自定义项创建。
 _CONFIGS = [
     # 全量微调
     TrainConfig(
         name="pi05_so101",
+        # 中文注释：全量微调版本使用普通 Gemma 权重；action chunk 为未来 10 步。
+        # discrete_state_input=False 表示 PI0.5 tokenizer 不把 state 离散化进 prompt token。
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotSO101DataConfig(
+            # 旧采集机上的硬编码路径；在当前服务器通常不可用，仅作历史配置参考。
             repo_id="/home/likunwei/lerobot/dataset/pickPlaceCube/",
             base_config=DataConfig(prompt_from_task=False),  # 从 task 提取 prompt
             extra_delta_transform=True,  # 绝对动作
@@ -1165,6 +1230,7 @@ _CONFIGS = [
             #     asset_id="trossen",
             # ),
         ),
+        # 全量和 LoRA 都从同一 PI0.5 base 起步，区别在模型 variant/freeze_filter。
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"), # 预训练基础模型
         num_train_steps=30000,  # 调整基于数据量
         batch_size=2,  # GPU 内存调整
@@ -1184,38 +1250,51 @@ _CONFIGS = [
         name="pi05_so101_lora",
         model=pi0_config.Pi0Config(
             pi05=True,
+            # 中文注释：两个 Transformer 都换成带 LoRA adapter 的结构；不是缩小 base 权重。
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            # 每次监督/预测 10 个未来控制目标，模型内部 shape 为 [10, 32]。
             action_horizon=10,
             #action_horizon=50,#修改：对标官方50步
+            # PI0.5 将归一化后的 state 数值离散化并拼入 prompt token，使状态真正进入语言前缀。
             discrete_state_input=True,
         ),
         data=LeRobotSO101DataConfig(
+            # 中文注释：从环境变量读取当前 blacknew 根目录，避免绑定旧机器绝对路径。
             repo_id=os.environ["SO101_DATASET_DIR"],
+            # 训练时 norm_stats 路径为 (data.assets.assets_dir 或 assets_base_dir/name)/blacknew；
+            # 推理时强制从 checkpoint/assets/blacknew 读取，确保与训练统计一致。
+            assets=AssetsConfig(asset_id="blacknew"),
             #repo_id="/home/likunwei/lerobot/dataset/sysmo32_fistbump_36_20260612",
+            # 不读取 tasks.parquet 的 "Grab the black cube"；使用 create() 中更完整的 default_prompt。
             base_config=DataConfig(prompt_from_task=False),
+            # blacknew 是 absolute action：前五关节转 delta，gripper 保持 absolute。
             extra_delta_transform=True,
             #extra_delta_transform=False,#绝对位置训练
             #use_gaussian_noise=True, #加入高斯噪声
+            # 当前噪声插件键不匹配且正式实验关闭；训练/推理均不会加噪。
             use_gaussian_noise=False, #推理时关闭
             gaussian_std=0.05
         ),
+        # 中文注释：初始化 base 权重后，freeze_filter 冻结原参数，只更新 LoRA adapter。
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=100000,
         batch_size=16,
         num_workers=12,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=3000,  # 热身步数增加到 1k
-            peak_lr=3e-4,  # 峰值学习率降到 1e-6,降低到1e-4
-            decay_steps=100000,  # 全程衰减
-            decay_lr=1e-7,  # 最终学习率很小
+            warmup_steps=3000,  # 前 3000 step 线性升至 peak_lr。
+            peak_lr=3e-4,  # LoRA 可用比全量微调更高的峰值学习率。
+            decay_steps=100000,  # 与总步数一致：warmup 后余弦衰减到训练结束。
+            decay_lr=1e-7,  # 训练末期的目标学习率。
         ),
+        # 0.5 的全局梯度裁剪比默认 1.0 更保守。
         optimizer=_optimizer.AdamW(clip_gradient_norm=0.5),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
+        # LoRA 不维护整套参数 EMA，减少额外显存/存储。
         ema_decay=None,
     ),
     #Sysmo32通用微调

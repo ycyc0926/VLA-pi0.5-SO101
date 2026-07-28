@@ -8,9 +8,8 @@
 /envs/
 /tmp/
 
-# Duplicate upstream working trees at the workspace root
-/openpi/
-/lerobot/
+# 官方 OpenPI / LeRobot 工作树也作为源码快照提交。
+# 它们内部的 .git 元数据和本地虚拟环境仍由下方规则排除。
 
 # Local notes that may contain machine-specific information
 /note.txt
@@ -65,10 +64,16 @@ Thumbs.db
 # Runtime and temporary files
 *.log
 *.lock
+!uv.lock
+!**/uv.lock
 *.tmp
 *.partial
 *.aria2
 
 # Nested repository metadata is not part of the source snapshot
 **/.git/
+
+# 打包父仓库快照时，嵌套仓库元数据会短暂改名；始终禁止提交。
+**/.git.local-backup
+**/.git.local-backup/
 

@@ -4,8 +4,8 @@ from huggingface_hub import hf_hub_download
 # 配置路径
 REPO_ID = "google/paligemma-3b-pt-224"
 SAVE_DIR = "/home/likunwei/lerobot/mergedModel/grabPlaceBall"
-# 如果你没运行过 login，请把下面的 None 换成你的 "hf_xxxxxxxx"
-HF_TOKEN = "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" 
+# 不在源码中保存访问令牌；如需私有仓库权限，请先 export HF_TOKEN。
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 # 需要补齐的 4 个关键配置文件
 files_to_download = [
