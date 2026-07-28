@@ -11,6 +11,10 @@
 # 官方 OpenPI / LeRobot 工作树也作为源码快照提交。
 # 它们内部的 .git 元数据和本地虚拟环境仍由下方规则排除。
 
+# 根官方 OpenPI 副本的 third_party 只有未初始化子模块元数据；
+# 实际 vendored 源码位于 custom_vla/openpi/third_party/。
+/openpi/third_party/
+
 # Local notes that may contain machine-specific information
 /note.txt
 
