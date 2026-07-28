@@ -72,6 +72,7 @@ Thumbs.db
 
 # Nested repository metadata is not part of the source snapshot
 **/.git/
+**/.git
 
 # 打包父仓库快照时，嵌套仓库元数据会短暂改名；始终禁止提交。
 **/.git.local-backup
