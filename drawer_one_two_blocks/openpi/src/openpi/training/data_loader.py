@@ -1,16 +1,3 @@
-"""OpenPI 训练数据加载入口。
-
-中文阅读主线：
-1. create_data_loader：把 TrainConfig 解析为 DataConfig，并选择 LeRobot/Torch 或 RLDS 路径；
-2. create_torch_dataset：打开原始 LeRobot 数据，并按 action_horizon 查询未来动作序列；
-3. transform_dataset：按 Repack -> 机器人语义 -> Normalize -> 模型格式的顺序包装单样本变换；
-4. TorchDataLoader：把单样本堆成 batch，并转换为 JAX 分片数组或 PyTorch Tensor；
-5. DataLoaderImpl：把字典包装成模型使用的 Observation，同时单独返回 actions。
-
-Dataset 变换是惰性的：创建 wrapper 时不会遍历全数据，真正访问 dataset[index]
-或从 DataLoader 取 batch 时才会读取视频/Parquet 并依次执行 transform。
-"""
-
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
@@ -30,6 +17,9 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+
+import json
+from pathlib import Path
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -66,12 +56,6 @@ class DataLoader(Protocol[T_co]):
 
 
 class TransformedDataset(Dataset[T_co]):
-    """给随机访问 Dataset 套一层“按样本执行”的 transform wrapper。
-
-    compose 只在初始化时组合多个变换；每次 __getitem__ 才先读取原始样本，
-    再严格按照传入列表的先后顺序执行。wrapper 不改变数据集长度。
-    """
-
     def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
@@ -81,6 +65,148 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+#openpi过滤数据增加的类：不修改原始数据集，在训练时创建一个“过滤视图”，只让DataLoader看到JSON指定的有效帧区间。
+class EpisodeRangeFilteredDataset(Dataset[T_co]):
+    """Expose only selected sample starts from an original LeRobot dataset.
+
+    The underlying Parquet files, videos, timestamps and episode metadata are
+    not modified. Each filtered index is mapped back to an original global
+    LeRobot dataset index before calling the original dataset.
+    """
+
+    def __init__(self, dataset: Dataset[T_co], filter_dict_path: str):
+        self._dataset = dataset
+        self._filter_dict_path = str(filter_dict_path)
+
+        filter_path = Path(filter_dict_path)
+
+        if not filter_path.is_file():
+            raise FileNotFoundError(
+                f"LeRobot filter JSON does not exist: {filter_path}"
+            )
+
+        with filter_path.open("r", encoding="utf-8") as stream:
+            keep_ranges = json.load(stream)
+
+        if not isinstance(keep_ranges, dict):
+            raise ValueError(
+                "LeRobot filter JSON must be an object mapping "
+                "episode_index to ranges"
+            )
+
+        # Build a robust mapping:
+        # episode_index -> (global dataset start, global dataset end).
+        #
+        # dataset.meta.episodes is a Hugging Face Dataset, not a normal dict,
+        # so iterate through its rows rather than testing dictionary membership.
+        episode_bounds: dict[int, tuple[int, int]] = {}
+
+        for episode_metadata in dataset.meta.episodes:
+            episode_index = int(episode_metadata["episode_index"])
+            episode_start = int(episode_metadata["dataset_from_index"])
+            episode_end = int(episode_metadata["dataset_to_index"])
+
+            if episode_end < episode_start:
+                raise ValueError(
+                    f"Invalid metadata bounds for episode {episode_index}: "
+                    f"[{episode_start}, {episode_end})"
+                )
+
+            episode_bounds[episode_index] = (
+                episode_start,
+                episode_end,
+            )
+
+        self._indices: list[int] = []
+        self._ranges_by_episode: dict[int, list[tuple[int, int]]] = {}
+
+        for episode_key, ranges in keep_ranges.items():
+            try:
+                episode_index = int(episode_key)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Invalid episode key in filter JSON: {episode_key!r}"
+                ) from error
+
+            if episode_index not in episode_bounds:
+                raise ValueError(
+                    f"Filter references unknown episode {episode_index}"
+                )
+
+            if not isinstance(ranges, list):
+                raise ValueError(
+                    f"Ranges for episode {episode_index} must be a list"
+                )
+
+            episode_start, episode_end = episode_bounds[episode_index]
+            episode_length = episode_end - episode_start
+
+            normalized_ranges: list[tuple[int, int]] = []
+            previous_end = 0
+
+            for range_index, range_pair in enumerate(ranges):
+                if (
+                    not isinstance(range_pair, list)
+                    or len(range_pair) != 2
+                ):
+                    raise ValueError(
+                        f"Invalid range #{range_index} for episode "
+                        f"{episode_index}: {range_pair!r}"
+                    )
+
+                start = int(range_pair[0])
+                end = int(range_pair[1])
+
+                # JSON intervals use the half-open convention [start, end).
+                if not 0 <= start <= end <= episode_length:
+                    raise ValueError(
+                        f"Out-of-bounds range for episode {episode_index}: "
+                        f"[{start}, {end}), "
+                        f"episode_length={episode_length}"
+                    )
+
+                if start < previous_end:
+                    raise ValueError(
+                        f"Overlapping or unordered ranges for episode "
+                        f"{episode_index}: previous_end={previous_end}, "
+                        f"next=[{start}, {end})"
+                    )
+
+                normalized_ranges.append((start, end))
+
+                self._indices.extend(
+                    range(
+                        episode_start + start,
+                        episode_start + end,
+                    )
+                )
+
+                previous_end = end
+
+            self._ranges_by_episode[episode_index] = normalized_ranges
+
+        if not self._indices:
+            raise ValueError(
+                f"LeRobot filter produced no sample starts: {filter_path}"
+            )
+
+        logging.info(
+            "Using LeRobot sample filter %s: kept %d / %d sample starts "
+            "across %d episodes",
+            filter_path,
+            len(self._indices),
+            len(dataset),
+            len(self._ranges_by_episode),
+        )
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        filtered_index = index.__index__()
+        original_index = self._indices[filtered_index]
+        return self._dataset[original_index]
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -151,42 +277,30 @@ class FakeDataset(Dataset):
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
-    """创建 LeRobot 随机访问数据集，但尚不执行 OpenPI 的主 transform 链。
-
-    Args:
-        data_config: 已由 TrainConfig.data.create() 生成的数据配置。这里主要使用
-            repo_id、action_sequence_keys 和 prompt_from_task。
-        action_horizon: 每个当前帧要配多少步动作。例如 10 表示 action 的目标 shape 为
-            [10, action_dim]，包含当前帧 t=0 和未来 9 帧。
-        model_config: 模型结构配置。真实 LeRobot 数据不直接使用它；仅 repo_id="fake"
-            时用它生成符合模型 input spec 的假数据。
-
-    Returns:
-        原始 LeRobotDataset，或额外包了一层 PromptFromLeRobotTask 的 Dataset。
-        此时还没有 Repack、Normalize、tokenize 或 padding。
-    """
+    """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    # 先读取 meta/info.json 和 meta/tasks.parquet：fps 用于把“第几帧”换算为秒，
-    # tasks 用于可选的 task_index -> 自然语言 prompt 映射。
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
-            # LeRobot 接口要求以“秒”为单位的相对时间。对 30 FPS、horizon=10，
-            # 这里会生成 [0, 1/30, ..., 9/30]，LeRobot 内部再换算成帧偏移 [0..9]。
-            # episode 尾部的越界索引会夹到最后一帧，并生成 <key>_is_pad 标志。
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
 
+    # Apply the optional keep-range filter only to sample start indices.
+    # The underlying LeRobot dataset remains unchanged.
+    if data_config.lerobot_filter_dict_path is not None:
+        dataset = EpisodeRangeFilteredDataset(
+            dataset,
+            data_config.lerobot_filter_dict_path,
+        )
+
     if data_config.prompt_from_task:
-        # 这层 wrapper 在主 Repack 之前运行。若后续 Repack 需要 prompt，必须显式把
-        # 新生成的 "prompt" 键写进 RepackTransform.structure，否则会被重组过程丢弃。
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
@@ -211,20 +325,7 @@ def create_rlds_dataset(
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
-    """给数据集安装 OpenPI 的训练输入变换链。
-
-    Args:
-        dataset: 通常是 create_torch_dataset 返回的逐帧 LeRobot Dataset。
-        data_config: 决定字段重组、机器人语义、归一化方式和模型输入格式。
-        skip_norm_stats: 为 True 时跳过统计量检查并让 Normalize 成为 no-op。
-            主要用于假数据、调试或检查原始数值；正式训练通常不应开启。
-
-    Returns:
-        惰性的 TransformedDataset；这里只定义顺序，不会立即遍历数据。
-
-    顺序不能随意交换：DeltaActions 等机器人语义变换必须发生在 Normalize 前；
-    PadStatesAndActions 放在 Normalize 后，避免用 6 维统计量处理补齐后的 32 维。
-    """
+    """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
@@ -237,13 +338,10 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     return TransformedDataset(
         dataset,
         [
-            # 1) 数据集 schema -> policy adapter 所期待的字段名/嵌套结构。
             *data_config.repack_transforms.inputs,
-            # 2) 机器人语义适配，例如 SO101Inputs 和 absolute -> delta action。
             *data_config.data_transforms.inputs,
-            # 3) 只对 norm_stats 中与样本同名的叶子（通常 state/actions）归一化。
+            *data_config.training_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            # 4) 模型格式：默认 prompt、图像 resize、tokenize、state/action padding。
             *data_config.model_transforms.inputs,
         ],
     )
@@ -271,6 +369,7 @@ def transform_iterable_dataset(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
+            *data_config.training_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
@@ -287,30 +386,20 @@ def create_data_loader(
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """从完整 TrainConfig 创建训练循环最终消费的 DataLoader。
+    """Create a data loader for training.
 
     Args:
-        config: 完整训练配置；会使用 model、data、assets_dirs、batch_size、
-            num_workers 和 seed 等字段。
-        sharding: JAX batch 的分片规则；PyTorch 路径忽略它。为 None 时，
-            TorchDataLoader 会创建沿 batch 轴 B 的默认数据并行分片。
-        shuffle: 是否打乱样本。训练通常为 True；统计或调试时可为 False。
-        num_batches: 最多产出多少个 batch。数据集耗尽会重新开始，因此可大于
-            单个 epoch 的 batch 数；None 表示无限迭代，由训练 step 数停止。
-        skip_norm_stats: 是否跳过 Normalize；仅适合假数据或诊断原始值域。
-        framework: "jax" 返回 JAX 分片数组；"pytorch" 返回 torch.Tensor，
-            且在 DDP 初始化后使用 DistributedSampler。
-
-    Returns:
-        迭代元素为 (Observation, actions)；actions 通常为
-        [local_batch, action_horizon, model.action_dim]。
+        config: The training configuration.
+        sharding: The sharding to use for the data loader (JAX only).
+        shuffle: Whether to shuffle the data.
+        num_batches: Determines the number of batches to return.
+        skip_norm_stats: Whether to skip data normalization.
+        framework: The framework to use ("jax" or "pytorch").
     """
-    # DataConfigFactory 在这里才真正读取 norm_stats、构造 Repack/data/model transforms。
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
-        # 当前只用于 DROID RLDS；SO-101/blacknew 的 rlds_data_dir=None，不走这里。
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -321,7 +410,6 @@ def create_data_loader(
             skip_norm_stats=skip_norm_stats,
             framework=framework,
         )
-    # LeRobot parquet + 视频数据走随机访问的 Torch DataLoader 路径。
     return create_torch_data_loader(
         data_config,
         model_config=config.model,
@@ -355,7 +443,6 @@ def create_torch_data_loader(
 
     Args:
         data_config: The data configuration.
-        model_config: 模型输入 spec；真实数据路径不直接使用，仅 fake dataset 分支使用。
         action_horizon: The action horizon.
         batch_size: The batch size.
         sharding: The sharding to use for the data loader. If None, the data loader will
@@ -368,15 +455,13 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
-        framework: jax 或 pytorch，决定分布式 sampler、local batch 划分和
-            最终数组类型。
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    # 两种框架都先复用 torch.utils.data.DataLoader 做多进程读取和 collate。
-    # batch_size 是全局 batch：PyTorch DDP 按 world_size 划分，JAX 按 process_count 划分。
-    # 注意按“进程”而非单进程内 GPU 数相除；单进程多卡由 JAX sharding 再切 batch 轴。
+    # Use TorchDataLoader for both frameworks
+    # For PyTorch DDP, create DistributedSampler and divide batch size by world size
+    # For JAX, divide by process count
     sampler = None
     if framework == "pytorch":
         if torch.distributed.is_initialized():
@@ -586,8 +671,6 @@ class RLDSDataLoader:
 
     def __iter__(self):
         num_items = 0
-        # 外层 while 让 loader 跨 epoch 循环。num_batches=None 时是无限数据流，
-        # 训练脚本最终由 config.num_train_steps 决定何时停止。
         while True:
             data_iter = iter(self._dataset)
             while True:
@@ -611,6 +694,4 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            # transform 链一直以 dict 传递数据；最外层才构造成模型 Observation。
-            # actions 独立返回，最终用于 model.compute_loss(rng, observation, actions)。
             yield _model.Observation.from_dict(batch), batch["actions"]

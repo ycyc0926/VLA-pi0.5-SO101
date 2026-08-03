@@ -25,6 +25,7 @@ import argparse
 from collections import deque
 from dataclasses import dataclass
 import math
+from pathlib import Path
 import threading
 import time
 import traceback
@@ -49,9 +50,6 @@ JOINT_KEYS = (
     "gripper.pos",
 )
 ACTION_DIM = len(JOINT_KEYS)
-DEFAULT_PROMPT = "Grab the black cube and place it in the white cup"  # 修改：默认 Prompt 与当前 blacknew_43k 训练配置严格一致。
-
-
 # ------------------------- 通用小工具 -------------------------
 
 def now_sec() -> float:
@@ -460,14 +458,30 @@ class RuntimeStats:
 
 # ------------------------- Robot helpers -------------------------
 
-def open_cam(index: int, width: int, height: int, request_buffer_size_one: bool) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index)
+def parse_camera_source(value: str) -> int | str:
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def open_cam(
+    source: int | str,
+    width: int,
+    height: int,
+    fps: float,
+    fourcc: str,
+    request_buffer_size_one: bool,
+) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(source)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
     if request_buffer_size_one:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 修改：尽力请求单帧缓存；具体是否生效由 OpenCV 后端决定。
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera at index {index}")
+        raise RuntimeError(f"Cannot open camera at source {source}")
     return cap
 
 
@@ -718,15 +732,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--host", default="192.168.1.110", help="OpenPI policy server IP")
     parser.add_argument("--port", type=int, default=5000, help="OpenPI policy server port")
-    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT, help="Exact training task string")
+    parser.add_argument("--prompt", type=str, required=True, help="Exact training task string")
     parser.add_argument("--serial", default="COM4", help="SO101 serial port")
+    parser.add_argument("--robot_id", default="my_awesome_follower_arm", help="Follower calibration file stem")
+    parser.add_argument(
+        "--calibration_dir",
+        type=Path,
+        required=True,
+        help="Directory containing <robot_id>.json for the follower arm",
+    )
     parser.add_argument("--use_degrees", action="store_true", help="Required: use degree units for body joints")
     parser.add_argument("--hz", type=float, default=30.0, help="Body control frequency")
 
-    parser.add_argument("--cam_top", type=int, default=2, help="OpenCV index for top camera")
-    parser.add_argument("--cam_wrist", type=int, default=0, help="OpenCV index for wrist camera")
+    parser.add_argument("--cam_top", type=parse_camera_source, default=2, help="OpenCV index or device path for top camera")
+    parser.add_argument("--cam_wrist", type=parse_camera_source, default=0, help="OpenCV index or device path for wrist camera")
     parser.add_argument("--cam_width", type=int, default=640, help="Requested camera width")
     parser.add_argument("--cam_height", type=int, default=480, help="Requested camera height")
+    parser.add_argument("--cam_fps", type=float, default=30.0, help="Requested camera stream FPS")
+    parser.add_argument("--cam_fourcc", default="MJPG", help="Requested four-character camera pixel format")
+    parser.add_argument("--camera_warmup_sec", type=float, default=3.0, help="Auto-exposure warmup before first inference")
     parser.add_argument("--capture_hz", type=float, default=30.0, help="Dedicated camera-pair capture target Hz")
     parser.add_argument("--camera_flush_grabs", type=int, default=0, help="Frames to discard before read() in the sole capture thread")
     parser.add_argument("--no_camera_buffer_one", action="store_true", help="Do not request CAP_PROP_BUFFERSIZE=1")
@@ -773,8 +797,12 @@ def validate_args(args: argparse.Namespace) -> None:
             "[FATAL] This client intentionally requires --use_degrees. "
             "Without it, current LeRobot SOFollower body joints are not radians; refuse to move."
         )
-    if args.hz <= 0 or args.capture_hz <= 0:
-        raise SystemExit("[FATAL] --hz and --capture_hz must be > 0")
+    if args.hz <= 0 or args.capture_hz <= 0 or args.cam_fps <= 0:
+        raise SystemExit("[FATAL] --hz, --capture_hz, and --cam_fps must be > 0")
+    if len(args.cam_fourcc) != 4:
+        raise SystemExit("[FATAL] --cam_fourcc must contain exactly four characters")
+    if args.camera_warmup_sec < 0:
+        raise SystemExit("[FATAL] --camera_warmup_sec must be >= 0")
     if not (0.0 < args.alpha <= 1.0):
         raise SystemExit("[FATAL] --alpha must be in (0, 1]")
     if args.expected_chunk_size < 1:
@@ -789,6 +817,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("[FATAL] --reject_stale_ratio must be > 0")
     if args.show_camera and (args.display_hz <= 0 or args.display_scale < 1):
         raise SystemExit("[FATAL] preview parameters are invalid")
+    calibration_file = args.calibration_dir / f"{args.robot_id}.json"
+    if not calibration_file.is_file():
+        raise SystemExit(f"[FATAL] Follower calibration file not found: {calibration_file}")
 
 
 # ------------------------- 主流程 -------------------------
@@ -924,15 +955,30 @@ def main() -> None:
             SO101FollowerConfig(
                 port=args.serial,
                 use_degrees=True,  # 修改：单位明确写死为 degrees，与命令行门禁双保险。
-                id="my_awesome_follower_arm",
+                id=args.robot_id,
+                calibration_dir=args.calibration_dir,
             )
         )
         robot.connect()
         validate_action_features(robot)
         print("Robot connected. action_features =", list(robot.action_features.keys()))
 
-        cap_top = open_cam(args.cam_top, args.cam_width, args.cam_height, not args.no_camera_buffer_one)
-        cap_wrist = open_cam(args.cam_wrist, args.cam_width, args.cam_height, not args.no_camera_buffer_one)
+        cap_top = open_cam(
+            args.cam_top,
+            args.cam_width,
+            args.cam_height,
+            args.cam_fps,
+            args.cam_fourcc,
+            not args.no_camera_buffer_one,
+        )
+        cap_wrist = open_cam(
+            args.cam_wrist,
+            args.cam_width,
+            args.cam_height,
+            args.cam_fps,
+            args.cam_fourcc,
+            not args.no_camera_buffer_one,
+        )
         print(f"Opened cameras: top={args.cam_top}, wrist={args.cam_wrist}")
 
         camera_capture = CameraPairCapture(
@@ -944,6 +990,10 @@ def main() -> None:
             flush_grabs=args.camera_flush_grabs,
         )
         camera_capture.start()
+
+        if args.camera_warmup_sec > 0:
+            print(f"[INFO] Warming up camera auto-exposure for {args.camera_warmup_sec:.1f}s")
+            time.sleep(args.camera_warmup_sec)
 
         # 修改：等待相机线程产出首帧，避免 Body 启动后才发现相机不可用。
         camera_deadline = now_sec() + 5.0

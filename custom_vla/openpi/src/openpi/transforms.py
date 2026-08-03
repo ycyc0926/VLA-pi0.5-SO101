@@ -1,3 +1,12 @@
+"""OpenPI 的轻量级、逐样本数据变换。
+
+训练输入的典型正向顺序是：
+RepackTransform -> 机器人 Inputs -> DeltaActions -> Normalize -> Tokenize/Pad。
+推理输出按逆向语义执行：Unnormalize -> AbsoluteActions -> 机器人 Outputs。
+
+不少 transform 会直接修改传入 dict 或其中的 numpy 数组；调试时不要默认输入保持不变。
+"""
+
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import re
@@ -92,6 +101,9 @@ class Group:
         Returns:
             A new group with the appended transforms.
         """
+        # 输入按正向顺序追加；输出要撤销输入语义，所以新输出插到最前面。
+        # 例如已有 RobotOutputs，再 push Delta/Absolute 后，输出顺序会是
+        # AbsoluteActions -> RobotOutputs：先恢复动作语义，再裁剪机器人维度。
         return Group(inputs=(*self.inputs, *inputs), outputs=(*outputs, *self.outputs))
 
 
@@ -130,9 +142,14 @@ class RepackTransform(DataTransformFn):
     }
     """
 
+    # structure 本身就是“目标结构”；每个叶子字符串指向原始 data 的扁平路径。
+    # 因此映射方向是 新键 -> 旧键，而不是常见的 旧键 -> 新键。
     structure: at.PyTree[str]
 
     def __call__(self, data: DataDict) -> DataDict:
+        # 只保留 structure 引用到的叶子；未列出的 task_index、timestamp 等会被丢弃。
+        # flatten_dict 对真正的嵌套层级使用 '/'。LeRobot 的
+        # "observation.images.env" 往往是带点号的顶层键，点号不会被拆分。
         flat_item = flatten_dict(data)
         return jax.tree.map(lambda k: flat_item[k], self.structure)
 
@@ -149,6 +166,16 @@ class InjectDefaultPrompt(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class Normalize(DataTransformFn):
+    """按 norm_stats 对同名叶子归一化，通常处理 state 和 actions。
+
+    use_quantiles=False 使用 z-score：(x - mean) / (std + eps)；
+    use_quantiles=True 把 q01 映射到 -1、q99 映射到 +1。这里不会 clip，
+    超出分位数范围的值仍可能小于 -1 或大于 +1。
+
+    默认 strict=False：没有统计量的图像/token 保持原样，统计量中暂时缺失的键
+    也不报错。推理侧 Unnormalize 使用 strict=True，防止动作无法恢复到真实单位。
+    """
+
     norm_stats: at.PyTree[NormStats] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantiles: bool = False
@@ -157,6 +184,7 @@ class Normalize(DataTransformFn):
 
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
+            # 分位数归一化要求每个统计叶子同时提供 q01 和 q99。
             _assert_quantile_stats(self.norm_stats)
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -171,6 +199,8 @@ class Normalize(DataTransformFn):
         )
 
     def _normalize(self, x, stats: NormStats):
+        # 训练中 Normalize 位于 Pad 前：SO-101 的 x 最后维是 6，
+        # 因此这里只取前 6 维统计量，不会让 6 维统计量直接处理补齐后的 32 维。
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
         return (x - mean) / (std + 1e-6)
 
@@ -178,6 +208,7 @@ class Normalize(DataTransformFn):
         assert stats.q01 is not None
         assert stats.q99 is not None
         q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
+        # 线性映射 [q01, q99] -> [-1, 1]，不做截断。
         return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
 
 
@@ -238,7 +269,12 @@ class SubsampleActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class DeltaActions(DataTransformFn):
-    """Repacks absolute actions into delta action space."""
+    """把 mask 选中的绝对动作维转换为“相对当前 state”的 delta。
+
+    对每个时间步执行 delta_action[t, d] = action[t, d] - state[d]。
+    state 是当前观测，而不是逐未来帧 state；同一份 state 会广播到整个 action horizon。
+    mask=False 的维度保持绝对值，例如 SO-101 的 gripper。
+    """
 
     # Boolean mask for the action dimensions to be repacked into delta action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
@@ -252,6 +288,9 @@ class DeltaActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
+        # actions 常见 shape=[T,D]、state=[D]。在 -2 轴插入长度 1 得到 [1,dims]，
+        # numpy 会沿 T 广播。若 mask 比动作维数短，只处理前 dims 维。
+        # “-=” 会原地修改 actions 对应数组，这是当前实现的有意行为。
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
 
@@ -260,7 +299,12 @@ class DeltaActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class AbsoluteActions(DataTransformFn):
-    """Repacks delta actions into absolute action space."""
+    """DeltaActions 的推理侧逆变换：给 mask 选中的维度加回当前 state。
+
+    对每个时间步执行 absolute_action[t, d] = delta_action[t, d] + state[d]；
+    未选中的绝对维（如 gripper）不变。它通常位于 Unnormalize 之后，因为相加双方
+    必须已经回到同一种机器人真实单位。
+    """
 
     # Boolean mask for the action dimensions to be repacked into absolute action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
@@ -274,6 +318,7 @@ class AbsoluteActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
+        # 与 DeltaActions 使用相同广播规则，在相同 state/mask 下二者互为逆操作。
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
 
@@ -282,10 +327,18 @@ class AbsoluteActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
+    """把自然语言 prompt（以及可选的离散 state）转换为 PaliGemma token。
+
+    输入必须包含 prompt；该键会被 pop 掉，输出改为固定长度的
+    tokenized_prompt 与 tokenized_prompt_mask。当 discrete_state_input=True
+    时，state 也传给 tokenizer 编入 token 序列，但原 state 键仍保留。
+    """
+
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
+        # pop 会修改原 data，使最终 batch 不再携带 Python 字符串。
         if (prompt := data.pop("prompt", None)) is None:
             raise ValueError("Prompt is required")
 
@@ -296,8 +349,10 @@ class TokenizePrompt(DataTransformFn):
             state = None
 
         if not isinstance(prompt, str):
+            # LeRobot/HF Dataset 可能把字符串包装为 0 维 numpy 标量。
             prompt = prompt.item()
 
+        # tokenizer 负责截断/补齐到 max_token_len，并返回有效 token 的 mask。
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
@@ -344,7 +399,11 @@ class ExtractFASTActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
-    """Extracts a prompt from the current LeRobot dataset task."""
+    """用样本 task_index 查询 meta/tasks.parquet，生成自然语言 prompt。
+
+    create_torch_dataset 在主 transform 链之前安装它。它保留 task_index；
+    后续 RepackTransform 是否保留 prompt，取决于 structure 是否列出该键。
+    """
 
     # Contains the LeRobot dataset tasks (dataset.meta.tasks).
     tasks: dict[int, str]
@@ -353,6 +412,7 @@ class PromptFromLeRobotTask(DataTransformFn):
         if "task_index" not in data:
             raise ValueError('Cannot extract prompt without "task_index"')
 
+        # task_index 可以是 Python int、numpy 标量或单元素 Tensor。
         task_index = int(data["task_index"])
         if (prompt := self.tasks.get(task_index)) is None:
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
@@ -362,7 +422,12 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
-    """Zero-pads states and actions to the model action dimension."""
+    """沿最后一维把 state/actions 右侧补零到模型统一 action_dim。
+
+    例如 SO-101 的 state [6] 变成 [32]，动作 [T,6] 变成 [T,32]。
+    该操作只补短向量，不截断超过 model_action_dim 的输入；机器人维数过大时
+    应在更早的 adapter 中显式处理。
+    """
 
     model_action_dim: int
 
@@ -440,6 +505,7 @@ def transform_dict(patterns: Mapping[str, str | None], tree: at.PyTree) -> at.Py
 def apply_tree(
     tree: at.PyTree[T], selector: at.PyTree[S], fn: Callable[[T, S], T], *, strict: bool = False
 ) -> at.PyTree[T]:
+    # Normalize/Unnormalize 通过叶子路径求交：selector 有同名统计量时才调用 fn。
     tree = flatten_dict(tree)
     selector = flatten_dict(selector)
 
@@ -457,7 +523,7 @@ def apply_tree(
 
 
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:
-    """Pad an array to the target dimension with zeros along the specified axis."""
+    """沿指定轴在右侧补到 target_dim；若已经等长或更长，原样返回而不截断。"""
     current_dim = x.shape[axis]
     if current_dim < target_dim:
         pad_width = [(0, 0)] * len(x.shape)
