@@ -2513,3 +2513,1069 @@ Brain 负责异步采集观测和请求模型，频率受 GPU/网络影响；Bod
 - 当前策略采用单步、action chunk 还是分层控制？实时推理的延迟预算是多少？
 - 对 behavior cloning 之外的 DAgger、offline RL 或在线 RL，团队目前采用什么路线？
 - 实习生是否有机会参与数据采集、训练和真机评测的完整闭环？
+
+## 34. 第一次 PI0.5 LoRA 微调：参数与训练指标详解
+
+本节整理第一阶段“抓取黑色物块放入白色杯子”任务的实际配置，并解释这些参数和指标在后续双物块抽屉任务中的含义。
+
+### 34.1 `config.py` 默认值与实际运行值要区分
+
+第一阶段新增的配置名为 `pi05_so101_lora`，代码位于：
+
+~~~text
+custom_vla/openpi/src/openpi/training/config.py
+~~~
+
+配置文件曾保留 `100000 steps`、`warmup=3000`、`peak_lr=3e-4`、`num_workers=12` 等默认值，但最终杯子实验通过训练命令覆盖了其中一部分。面试时应该以实际运行参数为准：
+
+| 参数 | 第一次杯子任务实际值 |
+| --- | ---: |
+| Config | `pi05_so101_lora` |
+| Batch size | 16 |
+| DataLoader workers | 4 |
+| Train steps | 50,000 |
+| Warmup steps | 1,000 |
+| Peak learning rate | `1e-4` |
+| Decay steps | 50,000 |
+| Final learning rate | `1e-6` |
+| Gradient clipping | 0.5 |
+| Action horizon | 10 |
+| Save interval | 1,000 |
+| Keep period | 5,000 |
+
+### 34.2 相比官方通用配置，主要适配了什么
+
+#### 模型与 LoRA
+
+- 选择 PI0.5：`pi05=True`。
+- 视觉语言主干使用 `gemma_2b_lora`。
+- Action Expert 使用 `gemma_300m_lora`。
+- 通过 `freeze_filter` 冻结基础参数，只训练允许更新的 LoRA adapter。
+- `ema_decay=None`，不额外维护一套完整 EMA 参数。
+- `action_horizon=10`，每个样本监督和预测未来 10 步动作。
+- 第一阶段杯子配置使用 `discrete_state_input=True`。后期抽屉混合配置是另一个实验，不能把这个布尔值推广到所有 checkpoint。
+
+#### SO101 数据适配
+
+- 数据路径改为 `SO101_DATASET_DIR`，避免绑定旧服务器绝对路径。
+- `asset_id="blacknew"`，加载该数据对应的 normalization statistics。
+- 将 `observation.images.env`、`observation.images.hand`、`observation.state` 和 `action` 重组为 OpenPI/SO101 期望的字段。
+- 使用固定 prompt：`Grab the black cube and place it in the white cup`。
+- 原始 SO101 action 是 absolute；前五个身体关节转换为相对当前 state 的 delta，gripper 保持 absolute。
+- 正式实验关闭高斯图像噪声。
+
+#### 优化与工程参数
+
+- 使用 AdamW，并将全局梯度裁剪阈值设为 0.5。
+- 调整 batch size、训练步数、warmup、peak/final learning rate。
+- 配置 W&B、日志间隔和 Orbax checkpoint 保存策略。
+- 将数据、权重、缓存、日志和 checkpoint 放到数据盘。
+
+### 34.3 `batch_size=16` 到底表示什么
+
+一个训练样本不是单独一张图，而是一个训练窗口：
+
+~~~text
+当前环境相机图像
++ 当前腕部相机图像
++ 当前机械臂 state
++ 语言指令
++ 从当前时刻开始的未来 10 步专家 action
+~~~
+
+`batch_size=16` 表示一次梯度更新同时读取 16 个这样的窗口，先对其 loss 求平均，再反向传播。
+
+Batch 较大时：
+
+- 梯度平均后通常更稳定，曲线更平滑。
+- GPU 并行利用率通常更高。
+- 显存消耗增加。
+- 对高度相关的机器人相邻帧而言，样本数增加不一定等于多样性同比增加。
+
+Batch 较小时：
+
+- 显存占用更低。
+- 梯度噪声和曲线波动更大。
+- 相同 step 数下看到的总训练窗口更少。
+
+第一阶段大致执行：
+
+~~~text
+50,000 steps × batch 16 = 800,000 个 sample windows
+~~~
+
+相对于约 31,000 个数据起点，相当于反复抽样约 25.8 轮。但 action window 互相重叠、相邻视频帧高度相关，因此不能理解成 25.8 轮完全独立的数据。
+
+### 34.4 Learning rate 控制什么
+
+Learning rate 控制每次优化器更新的总体尺度。直观近似为：
+
+~~~text
+新参数 ≈ 旧参数 - LR × 梯度
+~~~
+
+项目实际使用 AdamW，还会结合一阶动量、二阶矩估计和 gradient clipping，因此实际更新不完全等于这个简单公式。
+
+学习率太大时可能出现：
+
+- loss 剧烈震荡甚至发散；
+- 参数越过较优区域；
+- 梯度尖峰、NaN 或 Inf；
+- 小数据 LoRA 快速记住训练集。
+
+学习率太小时可能出现：
+
+- loss 下降很慢；
+- LoRA 参数几乎没有得到有效更新；
+- 固定训练时间内仍然欠拟合。
+
+第一阶段学习率调度为：
+
+~~~text
+step 0～1000：从很小的 LR 线性 warmup 到 1e-4
+step 1000～50000：cosine decay 到 1e-6
+~~~
+
+Warmup 防止训练刚开始时使用过大的更新尺度；后期 decay 让模型用更小的步长收敛。需要注意：warmup 直接控制的是 optimizer update，不是直接控制 `grad_norm`。LR 会通过之前的参数变化间接影响未来的梯度。
+
+Batch size 与 learning rate 有关联：更大的 batch 通常梯度方差更小，有时可以配合更大的 LR，但不能机械地线性放大。LoRA、小数据、强相关视频帧和真实机器人动作分布都会改变最佳组合，所以本项目选择 batch 16 和 peak LR `1e-4`，本质上是显存、吞吐和稳定性的折中。
+
+### 34.5 代入双物块抽屉任务，loss 是什么
+
+训练 loss 不是“是否把两个物块放进抽屉”，也不是任务完成率。它是 PI0.5 的 flow-matching 速度场回归误差。
+
+假设当前训练帧处于“机械臂正在接近黑块”阶段，一个样本包含当前双相机、state、完整任务 prompt，以及示范接下来的 10 步 action。30 Hz 下 10 步只覆盖：
+
+~~~text
+10 / 30 ≈ 0.333 秒
+~~~
+
+因此模型不是用一个 loss 直接监督整段约 45 秒任务，而是在每个时刻学习“接下来约 0.33 秒怎么动”。部署时持续获取新观测、反复预测短 action chunk，最终串成：
+
+~~~text
+开抽屉 → 抓黑块 → 放黑块 → 抓白块 → 放白块 → 关抽屉
+~~~
+
+设归一化后的真实未来动作 chunk 为 `a`，高斯噪声为 `epsilon`，随机 flow 时间为 `t`。代码构造：
+
+~~~text
+x_t = (1-t) * a + t * epsilon
+u_t = epsilon - a
+~~~
+
+模型根据图像、语言、state、带噪动作 `x_t` 和时间 `t` 预测速度 `v_theta`，优化：
+
+~~~text
+Loss = mean[(v_theta - u_t)^2]
+~~~
+
+代码对 batch、10-step horizon 和动作维度求平均。SO101 实际有 6 个动作维度，进入模型后会 padding 到 32 维，因此常见张量是 `[B, 10, 32]`。
+
+| 当前观测所处阶段 | 当前样本的监督内容 |
+| --- | --- |
+| 打开抽屉 | 示范接下来约 0.33 秒的拉抽屉动作 |
+| 接近黑块 | 接下来 10 步的关节接近轨迹 |
+| 抓黑块 | 关节微调和 gripper 闭合动作 |
+| 放置黑块 | 移动到抽屉并松开 gripper |
+| 白块阶段 | 对白块重复对应的局部动作 |
+| 关闭抽屉 | 推抽屉的局部接触动作 |
+
+总体 loss 是不同 episode、不同阶段和不同 batch 的平均。因此关闭抽屉即使学得较差，只要它占所有训练窗口的比例较小，总 loss 仍可能很好看。要分析长程任务，需要额外记录分阶段 loss 和真实机器人子任务成功率。
+
+不同实验如果 norm、action horizon、action dimensions 或数据过滤不同，loss 的绝对数值也不能直接横向比较。
+
+### 34.6 `grad_norm` 是什么
+
+代码记录：
+
+~~~python
+grad_norm = optax.global_norm(grads)
+~~~
+
+它是所有可训练参数梯度的全局 L2 范数：
+
+~~~text
+Grad norm = sqrt(sum(g_i^2))
+~~~
+
+`grads` 通过 `trainable_filter` 计算，因此主要反映 LoRA 可训练参数的梯度强度。它回答：
+
+> 当前这个 batch 产生的误差，想把可训练参数往多大的方向推动？
+
+| 现象 | 可能含义 |
+| --- | --- |
+| 前期较大 | 模型还没有适应新场景和动作分布 |
+| 总体逐渐下降 | 模型逐渐接近训练数据的监督目标 |
+| 偶发尖峰后恢复 | 当前 batch 更难或含有少见状态，通常可以接受 |
+| 长期增大 | 训练不稳定、异常数据或学习率过高 |
+| NaN/Inf | 数值训练已经失败 |
+| 长期接近 0 但 loss 很高 | 可能梯度消失或优化停滞 |
+
+项目的 gradient clipping 阈值是 0.5。日志中的 `grad_norm` 在 optimizer 裁剪前计算，因此偶尔看到大于 0.5 并不代表裁剪失效；Optax 随后会按比例缩小梯度再交给 AdamW。
+
+### 34.7 `param_norm` 是什么
+
+代码记录：
+
+~~~python
+param_norm = optax.global_norm(kernel_params)
+~~~
+
+即模型 kernel 权重的全局 L2 范数：
+
+~~~text
+Param norm = sqrt(sum(theta_i^2))
+~~~
+
+当前实现从合并后的完整模型中选取二维及以上 kernel，并排除了 bias、scale、position embedding 和 input embedding，但没有再次使用 LoRA `trainable_filter`。所以第一阶段约 `1803～1810` 的 param norm 很可能包含大量冻结的基础模型权重，不只是 LoRA adapter。
+
+因此不能说“param norm 上升就代表学到更多知识”。更准确的用途是：
+
+- 平滑变化说明整体权重没有突然数值爆炸；
+- 突然大幅跳变可能表示异常更新或 checkpoint 恢复问题；
+- NaN/Inf 表示训练失败；
+- 它不能表示任务成功率，也不能直接衡量 LoRA 学了多少。
+
+如果希望更精确分析 LoRA，可以额外记录：
+
+~~~text
+trainable_param_norm
+lora_param_norm
+update_norm
+update_norm / param_norm
+~~~
+
+### 34.8 三个指标应该一起怎么说
+
+| 指标 | 实际衡量内容 | 是否等于任务成功率 |
+| --- | --- | --- |
+| Loss | Flow velocity 的训练拟合误差 | 否 |
+| Grad norm | 当前 batch 对可训练参数的梯度强度 | 否 |
+| Param norm | 被统计 kernel 权重的整体尺度 | 否 |
+
+第一阶段训练结果可以支持的结论是：
+
+> Loss 从 `0.0609` 下降到约 `0.001～0.002`，grad norm 总体下降且尖峰能够恢复，param norm 平滑变化，没有出现 NaN 或参数爆炸，说明训练过程数值稳定，并且模型对训练示范的 flow-matching 拟合显著改善。
+
+不能得出的结论是“模型已经真正学会任务或具有良好泛化”。杯子任务正好说明：训练 loss 很低，物块或杯子位置稍微变化后仍可能失败。
+
+## 35. 为什么必须对齐 Calibration：它不只是活动范围
+
+### 35.1 先给结论
+
+“把一套数据迁移到另一套校准文件下”这个理解基本正确。更准确地说：
+
+> Calibration 定义了原始电机编码器空间与模型使用的 degrees/percentage 空间之间的映射。校准对齐就是保持物理姿态和动作不变，只把数据中的数值表达从 source calibration 改写为 target calibration 的表达。
+
+它不会改变视频中的机械臂姿态，也不会凭空生成新动作；改变的是 parquet 中 `observation.state` 和 `action` 的数字，以及依赖这些数字的统计量。
+
+### 35.2 校准文件中有什么
+
+SO101 每个电机的 calibration 至少包含：
+
+~~~text
+id
+drive_mode
+homing_offset
+range_min
+range_max
+~~~
+
+这些字段不只是安全活动范围：
+
+| 字段 | 含义 |
+| --- | --- |
+| `range_min/range_max` | 记录有效编码器范围；身体关节的中点还被当作 0° 参考，gripper 则用整个区间映射到 0～100 |
+| `homing_offset` | 定义原始物理编码器零点如何平移到当前电机的 Present Position 坐标 |
+| `drive_mode` | 可定义方向翻转；本项目转换脚本只接受两边均为 0 的情况 |
+
+因此 calibration 同时定义原点、方向、tick 到 degrees 的解释、夹爪百分比映射和合法范围。这就是它体现“坐标系”的地方。
+
+### 35.3 LeRobot 如何把编码器值变成角度
+
+对于身体关节，LeRobot 使用：
+
+~~~text
+mid = (range_min + range_max) / 2
+degree = (present_position - mid) * 360 / 4095
+~~~
+
+Feetech 电机中又有：
+
+~~~text
+present_position = physical_encoder_position - homing_offset
+~~~
+
+合起来就是：
+
+~~~text
+degree = (physical_encoder_position - homing_offset - mid) * 360 / 4095
+~~~
+
+可以看到，即使机械臂物理上一动不动，只要 `homing_offset` 或 range 中点不同，输出的 degree 就会不同。
+
+对夹爪，LeRobot 使用：
+
+~~~text
+percentage = (present_position - range_min)
+             / (range_max - range_min) * 100
+~~~
+
+因此不同的 range 宽度不仅改变原点，还可能改变夹爪数值的尺度。
+
+### 35.4 身体关节的具体数值例子
+
+假设同一个 shoulder 关节有两套 calibration。
+
+Source calibration：
+
+~~~text
+homing_offset = 100 ticks
+range_min = 1000
+range_max = 3000
+mid_source = 2000
+~~~
+
+Target calibration：
+
+~~~text
+homing_offset = 50 ticks
+range_min = 800
+range_max = 2800
+mid_target = 1800
+~~~
+
+现在 source 数据中记录：
+
+~~~text
+state_source  = 30°
+action_source = 40°
+~~~
+
+Source 的 30° 对应：
+
+~~~text
+present_source ≈ 2000 + 30/360*4095 = 2341.25 ticks
+physical_encoder ≈ present_source + homing_offset
+                 ≈ 2441.25 ticks
+~~~
+
+同一个物理编码器位置放到 target calibration 下：
+
+~~~text
+present_target ≈ 2441.25 - 50 = 2391.25 ticks
+degree_target ≈ (2391.25 - 1800)*360/4095
+              ≈ 51.98°
+~~~
+
+因此同一个物理姿态：
+
+~~~text
+Source 表示：30°
+Target 表示：约 51.98°
+~~~
+
+两套坐标之间的转换偏移是：
+
+~~~text
+offset_ticks = mid_source + homing_source
+               - homing_target - mid_target
+             = 2000 + 100 - 50 - 1800
+             = 250 ticks
+
+offset_degree = 250 * 360 / 4095
+              ≈ 21.98°
+~~~
+
+所以 source 数据迁移到 target 后：
+
+~~~text
+state_target  = 30 + 21.98 ≈ 51.98°
+action_target = 40 + 21.98 ≈ 61.98°
+~~~
+
+物理动作仍然是从当前姿态向正方向移动 10°，只是数值表达换成了 target 坐标系。
+
+### 35.5 为什么 state 和 action 都要改
+
+在数据集中：
+
+- `observation.state` 表示当前物理姿态；
+- `action` 表示示范者下一时刻希望 follower 到达的目标姿态。
+
+继续使用上面的例子，正确的物理运动是 +10°。
+
+| 处理方式 | 训练中看到的 state → action | 表面 delta | 是否正确 |
+| --- | --- | ---: | --- |
+| 两个都不转换 | `30 → 40` | `+10°` | 仍属于 source 表达，不能与 target absolute 数据直接混合 |
+| 只转换 state | `51.98 → 40` | `-11.98°` | 错误，运动方向和幅度都被破坏 |
+| 只转换 action | `30 → 61.98` | `+31.98°` | 错误，凭空放大动作 |
+| state/action 都转换 | `51.98 → 61.98` | `+10°` | 正确，物理运动保持不变 |
+
+行为克隆学习的是从 observation 到 action 的映射。只转换其中一个，相当于告诉模型：“机械臂现在在 target 坐标的 51.98°，专家却要求它去 source 坐标的 40°”，监督关系自然是错的。
+
+### 35.6 如果不转换 action，真机上会发生什么
+
+假设模型或数据仍输出 source 的 `40°`，但客户端使用 target calibration 解释这个值。Target 会把 40° 反算为：
+
+~~~text
+present_target = mid_target + 40/360*4095
+               ≈ 2255 ticks
+physical_encoder = present_target + homing_target
+                 ≈ 2305 ticks
+~~~
+
+而 source 的 40° 原本对应：
+
+~~~text
+physical_encoder ≈ 2000 + 40/360*4095 + 100
+                 ≈ 2555 ticks
+~~~
+
+两者相差约 250 ticks，也就是约 21.98°。因此完全相同的数字 `40°`，在两套 calibration 下会把机械臂发送到不同物理位置。
+
+### 35.7 夹爪为什么更必须转换
+
+夹爪使用 absolute 0～100，而不是前五轴那样转换为 delta。假设：
+
+Source gripper：
+
+~~~text
+homing_offset = 100
+range = [1000, 3000]
+~~~
+
+Target gripper：
+
+~~~text
+homing_offset = 300
+range = [700, 2500]
+~~~
+
+Source 数据中的 25% 对应：
+
+~~~text
+present_source = 1000 + 25% * 2000 = 1500
+physical_encoder = 1500 + 100 = 1600
+~~~
+
+同一物理夹爪位置在 target 下：
+
+~~~text
+present_target = 1600 - 300 = 1300
+target_percentage = (1300 - 700)/(2500 - 700)*100
+                  ≈ 33.33%
+~~~
+
+所以 source 的 25% 迁移到 target 后应写成约 33.33%。如果直接把 25% 发送给 target，它对应的物理夹爪开度会不同，可能导致抓不住或无法松开。
+
+### 35.8 本项目转换前后到底改变了什么
+
+转换前：
+
+~~~text
+视频：双物块示范的真实画面
+state/action：使用新采集者 calibration 表达
+统计信息：基于 source 数值计算
+~~~
+
+转换后：
+
+~~~text
+视频：完全不变
+episode/frame/task：完全不变
+前五轴 state/action：增加 source→target 的角度偏移
+wrist roll：转换后重新 wrap 到 [-180, 180)
+gripper state/action：按两套 range 和 homing offset 重新映射到 0～100
+episode/global stats：根据新数值重新计算
+~~~
+
+本项目实际计算出的 source→target 身体关节偏移为：
+
+| Joint | Offset |
+| --- | ---: |
+| shoulder_pan | `+1.318681°` |
+| shoulder_lift | `+0.175824°` |
+| elbow_flex | `+0.043956°` |
+| wrist_flex | `-0.263736°` |
+| wrist_roll | `-83.868132°` |
+
+wrist roll 的差异接近 84°，说明它绝不是可以忽略的浮点噪声。
+
+### 35.9 一个重要细节：前五轴 delta 会抵消常数零点偏移
+
+本项目训练时对前五个身体关节计算：
+
+~~~text
+delta_action = absolute_action - current_state
+~~~
+
+若 calibration 差异对某个身体关节只是同一个常数 `c`：
+
+~~~text
+(action + c) - (state + c) = action - state
+~~~
+
+因此，在“前五轴只使用 delta、模型完全不消费 absolute state、没有角度 wrap/方向/尺度变化”的理想条件下，身体关节的局部 delta 监督确实可能不受常数零点偏移影响。这也是为什么不能简单地说“不转换就一定导致每个 delta 都错误”。
+
+但项目仍统一转换，原因包括：
+
+1. gripper 保持 absolute，range 和 offset 不一致不会抵消；
+2. state 可能进入模型，具体取决于 checkpoint 的 `discrete_state_input` 和数据流；
+3. wrist roll 存在 `[-180,180)` 回绕，边界附近不能只按普通常数处理；
+4. 数据集中保留 absolute state/action，后续分析、norm、其他配置和真机 inverse transform 都需要统一语义；
+5. warm-start checkpoint 和旧单物块数据基于 target calibration，统一坐标能避免隐含的数据域标识和任务冲突；
+6. 当前转换成本低且可验证，比依赖“某个配置碰巧只看 delta”更稳健。
+
+这是更严谨的结论：校准转换对 absolute action/state 是必要的；对纯常数偏移下的 delta body action 数学上可能抵消，但完整系统仍然需要统一坐标约定。
+
+### 35.10 为什么转换后还要重新计算 norm
+
+Calibration 转换改变了 parquet 中 state/action 的数值分布，尤其 gripper 可能同时发生平移和缩放，wrist roll 还可能发生回绕。原来的 min/max/mean/std/quantile 已不再描述转换后的数据。
+
+因此需要依次更新：
+
+~~~text
+data parquet 中的 observation.state/action
+        ↓
+episode-level statistics
+        ↓
+global meta/stats.json
+        ↓
+按训练 filter、horizon 和 delta mask 重新计算 OpenPI norm_stats.json
+~~~
+
+Normalization 与 calibration 是两层不同的变换：
+
+- calibration：物理编码器空间 → 机器人统一的 degree/percentage 坐标；
+- normalization：degree/percentage 数据分布 → 模型更容易学习的数值范围。
+
+不能用重算 norm 代替 calibration 对齐。Norm 只能缩放统计分布，无法保证同一物理姿态在两批数据中具有相同语义。
+
+### 35.11 面试简洁回答
+
+> Calibration 不只是记录机械臂活动范围。对 SO101 来说，`homing_offset` 和 range 中点共同定义身体关节的 0°，range 还定义夹爪 0～100 的映射。因此同一物理姿态在两套 calibration 下可能分别表示成 30° 和 52°。我做的转换相当于保持视频和物理轨迹不变，把新数据中的 state/action 从 source 坐标重新表达成旧单物块 checkpoint 使用的 target 坐标。State 和 action 必须一起转换，否则 observation-action 监督会错位。前五轴若只有常数零点差并且训练只使用 delta，偏移在 `action-state` 中可能抵消；但夹爪是 absolute、state 可能进入模型、wrist roll 有回绕，而且数据分析、norm 和真机 inverse transform 都要求统一坐标，所以项目仍对完整 state/action 做了显式、可验证的迁移。
+
+## 36. 项目介绍 PPT 设计方案
+
+### 36.1 PPT 的目标和主线
+
+这份 PPT 面向 VLA、具身智能和机器人学习实习面试，建议正文控制在 8～10 分钟、10 页左右。它不是项目文档的压缩版，也不是安装命令汇总，而应讲清楚一条有转折的工程故事：
+
+```text
+为什么做真实机器人 VLA
+        ↓
+第一次杯子任务固定场景成功
+        ↓
+改变物体位置后失败，发现轨迹记忆
+        ↓
+重新设计位置随机化的长程双物块任务
+        ↓
+解决 calibration、数据融合、norm 和 warm-start
+        ↓
+解决公网时延、动作过期和真机安全问题
+        ↓
+完成双物块长程任务实机闭环验证
+        ↓
+分析关抽屉重试与尚未解决的能力边界
+```
+
+这条主线的核心不是“机械臂最终动了”，而是：
+
+- 完成数据、训练、部署和真机验证的全流程；
+- 从杯子任务的泛化失败中识别固定轨迹问题；
+- 根据失败结论主动改变第二阶段的数据采集；
+- 处理真实机器人数据中特有的 calibration、norm 和 action 语义一致性；
+- 对闭环恢复、成功率和未实施方案保持严谨表述。
+
+### 36.2 第 1 页：封面
+
+推荐标题：
+
+```text
+PI0.5 VLA 在 SO101 上的长程多任务操作与真机部署
+```
+
+副标题：
+
+```text
+从数据采集、LoRA 微调到视觉闭环执行
+```
+
+页面下方放：
+
+- 姓名；
+- 应聘方向：VLA / 具身智能 / 机器人学习实习；
+- 技术栈：PI0.5、OpenPI、LeRobot、SO101、LoRA、JAX。
+
+推荐视觉：使用最终双物块任务的真机画面，确保能够同时看到机械臂、抽屉和黑白物块。不要使用终端截图作为封面。
+
+开场话术：
+
+> 这个项目不是只完成了一次模型微调，而是完整走通了 VLA 从数据采集、数据处理、训练到真实机械臂部署的闭环，并通过第一次任务的泛化失败重新设计了第二阶段的数据。
+
+### 36.3 第 2 页：项目目标与最终结果
+
+推荐标题：
+
+```text
+项目目标：打通真实机器人的完整 VLA 闭环
+```
+
+左侧使用流程图：
+
+```text
+Leader/Follower 遥操作采集
+            ↓
+LeRobot v3 双相机数据
+            ↓
+PI0.5 LoRA 微调
+            ↓
+GPU Policy Server
+            ↓
+SO101 视觉闭环执行
+```
+
+右侧只放最终结果：
+
+- 支持单物块和双物块两条语言指令；
+- 双物块任务包含四个连续子任务；
+- 完成端到端真实 SO101 验证；
+- 服务端推理中位延迟约 66 ms；
+- 局域网 RTT 中位数约 90 ms。
+
+页面底部使用四张连续帧：
+
+```text
+开抽屉 → 放黑块 → 放白块 → 关抽屉
+```
+
+本页只让面试官先知道“项目做到了哪里”，不要提前展开 config 和 loss。
+
+### 36.4 第 3 页：第一阶段——杯子任务
+
+推荐标题：
+
+```text
+第一次成功，却暴露了轨迹记忆问题
+```
+
+建议三栏布局：
+
+#### 已完成
+
+- 使用同事采集的 50 episodes、31,000 帧双相机数据；
+- 在 AutoDL 完成 50k-step PI0.5 LoRA 微调；
+- 迁移到公司局域网服务器后完成固定场景真机推理。
+
+#### 发现的问题
+
+- 物块或杯子位置稍微变化后任务明显失败；
+- 机械臂仍执行接近训练示范的一条轨迹。
+
+#### 得出的结论
+
+> 固定场景中的一次成功，不等于模型学会了任务。
+
+推荐视觉：左侧放固定位置成功帧，右侧放位置变化失败帧，中间标出物块/杯子的位置变化。最好准备一段 10～15 秒失败视频。
+
+本页是整场介绍的转折点，需要主动说明训练 loss 已经很低，但位置泛化仍然差，从而说明 loss 不等于真机成功率。
+
+### 36.5 第 4 页：重新设计长程任务和数据
+
+推荐标题：
+
+```text
+从固定轨迹复现到位置随机化的长程任务
+```
+
+首先展示任务顺序：
+
+```text
+打开抽屉
+   ↓
+抓取黑色物块并放入
+   ↓
+抓取白色物块并放入
+   ↓
+关闭抽屉
+```
+
+然后展示数据设计：
+
+- 本人采集 30 episodes、40,355 帧；
+- 环境相机 + 腕部相机；
+- 6 维 state、6 维 action；
+- 采集频率 30 Hz；
+- 在相机可见、机械臂可达范围内随机放置黑白物块。
+
+推荐视觉：放 3～4 组不同物块摆放位置的顶视图，使用相同颜色的框标出黑块和白块。图片比“进行了数据增强”这句话更有说服力。
+
+讲解重点：
+
+> 数据随机化不是范围越大越好。它必须保持在相机可见、机械臂可达、遥操作能够稳定完成的范围内，否则少量数据会同时引入过多变化。
+
+### 36.6 第 5 页：Calibration 对齐
+
+推荐标题：
+
+```text
+两批数据不能直接合并：Calibration 定义了坐标表达
+```
+
+推荐结构图：
+
+```text
+单物块数据（Target Calibration）
+                    \
+                     → 坐标统一 → Mixed Dataset
+                    /
+双物块数据（Source Calibration）
+```
+
+页面正文只保留四点：
+
+- 两批数据由不同人员使用不同 calibration 采集；
+- calibration 不只是活动范围，还定义关节零点和夹爪 0～100 映射；
+- 同时转换 `observation.state` 与 `action`；
+- wrist roll 的 source→target 偏移约为 `-83.87°`。
+
+页面右下角放一个简化数值例子：
+
+```text
+同一物理姿态：
+Source 表示为 30°
+Target 表示为 51.98°
+
+Source：state 30 → action 40
+Target：state 51.98 → action 61.98
+物理运动仍为 +10°
+```
+
+讲解重点：只转换 state 或只转换 action 都会破坏 observation-action 对应关系。可以补充一个严谨例外：如果前五轴只有常数零点偏移且训练只看 delta，偏移可能抵消；但 gripper absolute、state 输入、wrist wrap、norm 和完整数据语义仍要求统一 calibration。
+
+### 36.7 第 6 页：数据融合与训练方案
+
+推荐标题：
+
+```text
+如何把单物块技能扩展为单/双物块多任务策略
+```
+
+先放数据表：
+
+| 数据 | Episodes | Frames | Task prompt |
+| --- | ---: | ---: | --- |
+| 单物块 | 32 | 33,478 | 单物块指令 |
+| 双物块 | 30 | 40,355 | 双物块指令 |
+| 合计 | 62 | 73,833 | 2 tasks |
+
+再画训练流程：
+
+```text
+单物块数据 + 校准后的双物块数据
+                 ↓
+保留两条 task prompt
+                 ↓
+Mixed sample-start filter
+                 ↓
+按实际 action 语义重新计算 mixture norm
+                 ↓
+加载单物块 checkpoint 35000/params
+                 ↓
+Fresh optimizer 训练 50,000 steps
+```
+
+右下角放关键参数：
+
+```text
+Batch size: 16
+Action horizon: 10
+Warmup: 1,000
+Peak LR: 2e-5
+Final checkpoint: 49999
+```
+
+必须主动解释：
+
+> 这是参数 warm-start，不是从旧实验带着 optimizer 直接 resume。新旧数据 mixture、filter 和 norm 已经改变，所以新实验从 step 0 使用 fresh optimizer；只有新混合实验自身中断后才使用 resume。
+
+### 36.8 第 7 页：PI0.5 数据与模型流程
+
+推荐标题：
+
+```text
+从双相机观测到 10-step Action Chunk
+```
+
+推荐横向流程图：
+
+```text
+双相机 + Prompt + 6D State
+              ↓
+Repack / SO101 Inputs
+              ↓
+前五轴 Delta + Gripper Absolute
+              ↓
+Normalization
+              ↓
+PaliGemma 视觉语言主干
+              ↓
+Action Expert + Flow Matching
+              ↓
+[10, 32] Action Chunk
+              ↓
+反归一化 + 恢复 Absolute + 裁成 [10, 6]
+```
+
+正文只解释三个理论点：
+
+- LoRA：冻结基础权重，用低秩参数适配少量真机数据；
+- Flow matching：从带噪动作学习速度场，推理时从噪声积分得到动作序列；
+- Action chunking：一次预测未来 10 步，学习短期时间一致性并减少推理调用。
+
+Loss 可以在图下简写为：
+
+```text
+x_t = (1-t)a + tε
+u_t = ε-a
+Loss = mean[(vθ-u_t)²]
+```
+
+不要在正文推导 Transformer、RoPE 或完整 flow matching 数学，放到技术附录即可。
+
+### 36.9 第 8 页：真机部署与实时闭环
+
+推荐标题：
+
+```text
+公网可连接，不等于满足实时控制
+```
+
+画出部署结构：
+
+```text
+本地 Ubuntu
+双相机 + SO101 + 30 Hz Body
+              │
+              │ WebSocket
+              ▼
+公司 GPU 服务器
+PI0.5 Policy Server
+```
+
+放一张延迟对比表：
+
+| 部署方式 | 延迟表现 | 结论 |
+| --- | ---: | --- |
+| AutoDL 公网 | 单轮约 1～3 秒 | 超过整个 action horizon |
+| 公司局域网 | RTT 中位数约 90 ms | 可以进行短 action chunk 闭环 |
+
+突出计算：
+
+```text
+10 steps / 30 Hz ≈ 333 ms
+```
+
+客户端实现：
+
+- Camera、Brain、Body 解耦；
+- 根据 observation/action age 跳过已过期的 chunk 前缀；
+- stale action 拒绝；
+- 动作低通、关节/夹爪限幅；
+- 异常、断线或无新动作时安全 Hold。
+
+讲解重点：端口能连通只证明网络可达，不能证明动作到达时仍然有效。
+
+### 36.10 第 9 页：真机结果与失败分析
+
+推荐标题：
+
+```text
+完成端到端任务，但关闭阶段仍是主要瓶颈
+```
+
+左侧嵌入 20～30 秒最终任务视频或四张连续帧；右侧放结论：
+
+- 同一 checkpoint 可根据 prompt 执行单物块和双物块任务；
+- 双物块任务完整执行到最终关闭抽屉；
+- 物块位置存在变化时仍能完成抓取；
+- 关闭抽屉有时需要多次重新定位。
+
+建议使用结果分级：
+
+| 分类 | 定义 |
+| --- | --- |
+| 严格成功 | 固定时限内一次完成所有子任务，无明显关闭反复 |
+| 恢复后成功 | 首次关闭失败，策略根据新观测自行调整后完成 |
+| 部分成功 | 两个物块已放入，但抽屉未完全关闭 |
+| 失败 | 超时、人工干预、危险碰撞、掉落或顺序错误 |
+
+推荐表述：
+
+> 关闭失败后，策略会根据后续观测产生不同动作并最终完成，说明系统呈现一定的视觉闭环恢复行为。但这不能直接证明模型理解了失败，也不能用一次最终成功代替标准化成功率。
+
+如果有空间，可以放一次 90 秒运行指标：服务端约 65.9 ms、RTT 约 89.9 ms、接受 776 个动作块、stale 拒绝 1 次、Body missed ticks 为 0。
+
+### 36.11 第 10 页：总结、个人贡献与下一步
+
+推荐标题：
+
+```text
+项目总结：真实 VLA 的难点是全链路一致性
+```
+
+左侧放个人贡献：
+
+- 设计并采集位置随机化的双物块数据；
+- 完成跨 calibration 的 state/action 转换；
+- 完成数据合并、task prompt、filter 和 norm；
+- 完成 PI0.5 LoRA warm-start、训练恢复和 W&B/Orbax 管理；
+- 构建局域网视觉闭环和真机安全控制；
+- 从失败现象区分数据、模型、网络、客户端和硬件问题。
+
+右侧放尚未实施的下一步：
+
+- 随机化抽屉位置、开度和推入接触点；
+- 增加首次推偏、没有关严等恢复示范；
+- 清理 episode 开头黑屏和曝光异常帧；
+- 进行 20～30 次固定时限标准化评测；
+- 在数据和评测成熟后尝试 RL 后训练。
+
+结束语：
+
+> 这个项目让我认识到，真实机器人 VLA 的核心不只是模型训练，而是数据分布、calibration、动作语义、系统实时性、安全控制和闭环评测的一致性。
+
+### 36.12 技术附录建议
+
+附录用于面试官追问，不计入 10 页正文，也不需要主动逐页讲。
+
+#### 附录 A：LoRA
+
+放公式：
+
+```text
+W = W0 + (alpha/r)BA
+```
+
+准备回答训练参数量、显存、rank、学习率和小数据过拟合。
+
+#### 附录 B：Flow Matching 与 Loss
+
+使用“真实动作 ↔ 带噪动作”的箭头图，说明 `x_t`、目标速度 `u_t` 和模型预测 `v_theta`。补充 loss 不是完整任务奖励，而是局部 10-step 速度回归误差。
+
+#### 附录 C：Warm-start 与 Resume
+
+| Warm-start | Resume |
+| --- | --- |
+| 只加载模型参数 | 恢复模型、optimizer、step 和数据状态 |
+| 可用于新数据 mixture | 只适合同一实验中断 |
+| 新实验从 step 0 开始 | 延续原实验 step |
+
+#### 附录 D：Calibration
+
+展示：
+
+```text
+physical encoder
+      ↓ homing_offset / range
+degrees or gripper percentage
+      ↓ dataset norm
+model normalized value
+```
+
+放 `30°→40°` 迁移成 `51.98°→61.98°` 的例子，并准备解释为什么 state/action 要一起转换。
+
+#### 附录 E：Loss、Grad Norm、Param Norm
+
+| 指标 | 含义 | 不能说明什么 |
+| --- | --- | --- |
+| Loss | Flow velocity 拟合误差 | 不能直接说明任务成功率 |
+| Grad norm | 可训练参数梯度的全局范数 | 不能直接说明模型能力 |
+| Param norm | 当前代码统计的 kernel 总体尺度 | 不能说明 LoRA 学到了多少 |
+
+#### 附录 F：正式评测与消融
+
+准备位置分组、子任务成功率、首次关闭/恢复后关闭、完成时间和安全失败指标，以及固定位置 vs 随机位置、单相机 vs 双相机、旧 norm vs mixture norm 等消融方案。
+
+### 36.13 最值得准备的展示素材
+
+正文优先使用以下材料：
+
+1. 20～30 秒双物块最终任务视频，保留完整任务顺序；
+2. 杯子位置变化后的失败视频，用来解释为什么重新设计数据；
+3. 3～4 张不同黑白物块位置的采集画面；
+4. calibration 转换前后的关节分布，重点显示 wrist roll；
+5. 数据样例：双相机、state/action 和 task prompt；
+6. W&B loss/grad norm/param norm 曲线，并主动标注“训练指标 ≠ 真机成功率”；
+7. 客户端 RTT、action age 和 stale 统计截图；
+8. 一张完整系统架构图和一张失败分析图。
+
+最有说服力的展示顺序是：
+
+```text
+杯子位置变化后的失败
+        ↓
+第二阶段位置随机化数据
+        ↓
+最终双物块任务视频
+```
+
+它能够直观呈现“发现问题—重新设计—完成验证”的项目闭环。
+
+### 36.14 PPT 视觉规范
+
+- 使用 16:9 页面比例；
+- 正文 9～10 页，每页只表达一个核心观点；
+- 标题尽量写成结论，例如“公网可连接，不等于满足实时控制”；
+- 标题字号至少 30 pt，正文字号至少 20～22 pt；
+- 每页正文尽量不超过 6～8 个短句；
+- 使用最多三种主色：深色正文、蓝色方案、红色问题/风险；
+- 图片和流程图优先于大段文字；
+- 不在正文放长命令、完整 config、终端安装日志和大段源码；
+- 流程箭头、字体、圆角和颜色风格保持一致；
+- 图片标注清楚 `env camera`、`wrist camera`、黑块、白块和抽屉；
+- 所有视频保存在本地并提前测试，不依赖现场网络。
+
+### 36.15 8～10 分钟演讲时间分配
+
+| 页面 | 建议时间 |
+| --- | ---: |
+| 1. 封面 | 20 秒 |
+| 2. 目标与结果 | 45 秒 |
+| 3. 杯子任务与泛化失败 | 60 秒 |
+| 4. 双物块任务与数据设计 | 60 秒 |
+| 5. Calibration | 75 秒 |
+| 6. 数据融合与训练 | 75 秒 |
+| 7. 模型数据流 | 60 秒 |
+| 8. 部署与实时性 | 75 秒 |
+| 9. 结果与失败分析 | 75 秒 |
+| 10. 总结 | 40 秒 |
+
+如果只有 5 分钟，可以合并：
+
+- 第 1、2 页；
+- 第 4、5、6 页为一页“数据与训练”；
+- 第 7、8 页为一页“模型与部署”；
+- 保留第 3 页失败转折和第 9 页最终结果。
+
+### 36.16 演讲时的表达原则
+
+- 先说结论，再解释原因，最后给数字或视频证据；
+- 主动区分本人采集的双物块数据与同事已有的杯子/单物块数据；
+- 不从 Conda、依赖下载和系统盘清理开始讲项目；
+- 不把 loss 下降说成任务成功率提升；
+- 不把恢复后成功说成模型“理解失败”或“自主思考”；
+- 不把 RL、抽屉随机化和恢复数据写成已经完成；
+- 不回避失败，杯子任务泛化失败是推动第二阶段设计的关键证据；
+- 当面试官追问理论时再进入附录，正文始终围绕项目决策和实验结果。
+
+### 36.17 PPT 开场与结束完整话术
+
+开场：
+
+> 我介绍的是 PI0.5 在 SO101 上的端到端 VLA 项目。我完整参与了训练部署、双物块任务设计与采集、跨 calibration 数据融合、LoRA 继续训练和局域网真机闭环。项目最重要的转折是：第一次杯子任务虽然在固定位置成功，但位置变化后模型仍重复相似轨迹，所以我没有把一次成功当作任务学会，而是在第二阶段主动随机化物块位置并设计了更长程的双物块抽屉任务。
+
+结束：
+
+> 最终同一个 checkpoint 能够根据语言指令执行单物块和双物块任务，双物块任务完成了端到端实机验证。关闭阶段仍会出现重试，因此我将结果区分为严格成功和恢复后成功，没有宣称未经统计的稳定成功率。这个项目让我认识到，真实 VLA 的核心不仅是模型本身，而是数据分布、calibration、norm、动作语义、实时控制和评测标准的全链路一致性。
